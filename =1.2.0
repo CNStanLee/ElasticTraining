@@ -1,0 +1,17 @@
+Collecting hls4ml
+  Downloading hls4ml-1.2.0-py3-none-any.whl.metadata (11 kB)
+Requirement already satisfied: h5py in /home/specs/anaconda3/envs/ehgq/lib/python3.12/site-packages (from hls4ml) (3.15.1)
+Requirement already satisfied: numpy in /home/specs/anaconda3/envs/ehgq/lib/python3.12/site-packages (from hls4ml) (2.3.5)
+Collecting pydigitalwavetools==1.1 (from hls4ml)
+  Downloading pyDigitalWaveTools-1.1-py3-none-any.whl.metadata (3.1 kB)
+Collecting pyyaml (from hls4ml)
+  Downloading pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.4 kB)
+Requirement already satisfied: quantizers in /home/specs/anaconda3/envs/ehgq/lib/python3.12/site-packages (from hls4ml) (1.2.2)
+Downloading hls4ml-1.2.0-py3-none-any.whl (3.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.2/3.2 MB 26.5 MB/s  0:00:00
+Downloading pyDigitalWaveTools-1.1-py3-none-any.whl (13 kB)
+Downloading pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (807 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 807.9/807.9 kB 32.0 MB/s  0:00:00
+Installing collected packages: pydigitalwavetools, pyyaml, hls4ml
+
+Successfully installed hls4ml-1.2.0 pydigitalwavetools-1.1 pyyaml-6.0.3
