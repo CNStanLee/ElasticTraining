@@ -74,7 +74,7 @@ data_save_epochs = 1000
 # Toggle writing full .mat/.npz files. Set to False to disable heavy disk writes.
 save_mat = False
 # beta scheduling
-epochs = 20000 # >50
+epochs = 200000 # >50
 # beta 0, 4000, 200000
 beta_sch_0 = 0
 beta_sch_1 = epochs // 50  # start ramping later (10% of training)

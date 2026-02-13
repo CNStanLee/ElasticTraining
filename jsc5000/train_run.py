@@ -66,21 +66,22 @@ input_folder = 'data/dataset.h5'
 output_folder = 'results/'
 batch_size = 33200
 learning_rate = 5e-3
-fig_update_epochs = 2000
-plot_window_epochs = 4000  # only plot the last N epochs to keep plotting fast
+fig_update_epochs = 500
+plot_window_epochs = 1000  # only plot the last N epochs to keep plotting fast
 # how often to write full .mat/.npz data files (reduce I/O by increasing)
 # Set to 1 to save every epoch (slow), larger values reduce disk writes.
-data_save_epochs = 1000
+data_save_epochs = 250
 # Toggle writing full .mat/.npz files. Set to False to disable heavy disk writes.
 save_mat = False
 # beta scheduling
-epochs = 20000 # >50
+epochs = 5000 # >50
 # beta 0, 4000, 200000
 beta_sch_0 = 0
 beta_sch_1 = epochs // 50  # start ramping later (10% of training)
 beta_sch_2 = epochs
 # Use smaller max beta for shorter runs to avoid getting stuck
-beta_max = min(1e-3, 5e-7 * (epochs / 100))  # scale max beta with epochs
+# beta_max = min(1e-3, 5e-7 * (epochs / 100))  # scale max beta with epochs
+beta_max = 1e-3 * (200000/epochs)  # scale max beta inversely with epochs, so shorter runs have higher max beta
 #
 
 
