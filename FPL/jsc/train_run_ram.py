@@ -16,7 +16,7 @@ from utils.train_utils import cosine_decay_restarts_schedule
 from utils.tf_device import get_tf_device
 from utils.train_utils import TrainingTraceToH5
 
-from utils.ramaujian_utils import apply_ramanujan_init
+from utils.ramaujian_utils import apply_ramanujan_init, RamanujanMaskEnforcer
 
 np.random.seed(42)
 random.seed(42)
@@ -25,15 +25,36 @@ input_folder = 'data/dataset.h5'
 output_folder = 'results/ram_init/' 
 batch_size = 33200
 learning_rate = 5e-3
-epochs = 200000
-
-beta_sch_0 = 0
-beta_sch_1 = epochs // 50
-beta_sch_2 = epochs
-beta_max = min(1e-3, 5e-7 * (epochs / 100))
 
 # Ramanujan init degree
-ram_degree = 8
+# 理论依据：有效度下限 ≈ sqrt(in_dim)（保证谱间隙 / 扩展性）。
+# degree 过小（如 4）会导致容量瓶颈，精度上限被锁死。
+# 用 per_layer_degree 按各层输入宽度单独设置：
+#   t1 (in=16): sqrt(16)=4, 设 8 留余量
+#   t2 (in=64): sqrt(64)=8, 设 12 保证扩展性同时保持稀疏
+#   t3 (in=64): 同 t2
+#   out(in=32): sqrt(32)≈6, 设 8
+ram_degree = 8  # 全局默认（兜底，实际被 per_layer_degree 覆盖）
+ram_per_layer_degree = {
+    't1':  8,   # in=16,  sparsity=50.0%
+    't2': 12,   # in=64,  sparsity=81.3%
+    't3': 12,   # in=64,  sparsity=81.3%
+    'out': 8,   # in=32,  sparsity=75.0%
+}
+
+# ── Epochs & beta schedule ────────────────────────────────────────────────────
+# Ramanujan init 以高稀疏度（隐藏层 ~94%）为起点，与 baseline（全连接）相比：
+#   1. warmup（beta_sch_1）须更长：让稀疏拓扑先学出合理精度，再施加位宽压缩压力。
+#      baseline 用 epochs//50（4000），这里用 epochs//10（15000），约 5x 更长。
+#   2. 总 epochs 适当缩短（150000 vs 200000）：模型从已压缩状态出发，不需要
+#      像 baseline 那样花大量 epoch 慢慢「学会压缩」。
+# ─────────────────────────────────────────────────────────────────────────────
+epochs = 12000
+
+beta_sch_0 = 0
+beta_sch_1 = epochs // 10   # 1200  (baseline: epochs//50 = 4000)
+beta_sch_2 = epochs
+beta_max = min(1e-3, 5e-7 * (epochs / 100))
 
 device = get_tf_device()
 os.makedirs(output_folder, exist_ok=True)
@@ -68,10 +89,11 @@ if __name__ == '__main__':
     apply_ramanujan_init(
         model,
         default_degree=ram_degree,
-        per_layer_degree=None,
+        per_layer_degree=ram_per_layer_degree,
         seed=42,
-        include_dense=True,
-        include_conv=True,
+        pruned_frac_bits=0.0,
+        pruned_int_bits=0.0,
+        also_zero_kernel=True,
     )
     print('Ramanujan initialization done.')
     # ==========================================================
@@ -95,7 +117,8 @@ if __name__ == '__main__':
         beta_callback=beta_sched,
     )
 
-    callbacks = [ebops_cb, pareto_cb, beta_sched, lr_sched, trace_cb]
+    ram_enforcer = RamanujanMaskEnforcer()
+    callbacks = [ebops_cb, pareto_cb, beta_sched, lr_sched, trace_cb, ram_enforcer]
 
     opt = keras.optimizers.Adam()
     metrics = ['accuracy']

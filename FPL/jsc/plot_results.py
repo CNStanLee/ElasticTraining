@@ -142,6 +142,9 @@ def plot_acc_ebops_vs_epochs_compare(
         linewidth=2.3,
         marker='o',
         markersize=5,
+        markerfacecolor='white',
+        markeredgewidth=1.2,
+        markevery=max(len(curr_epochs) // 40, 1),
         alpha=0.95,
         label='Current Accuracy',
         zorder=3,
@@ -150,6 +153,7 @@ def plot_acc_ebops_vs_epochs_compare(
     ax1.grid(True, alpha=0.3)
 
     ax2 = ax1.twinx()
+    ax2.patch.set_alpha(0.0)
     ax2.set_ylabel('EBOPs', color='tab:red')
     line2_base = ax2.plot(
         base_epochs,
@@ -176,6 +180,7 @@ def plot_acc_ebops_vs_epochs_compare(
     ax2.tick_params(axis='y', labelcolor='tab:red')
 
     ax3 = ax1.twinx()
+    ax3.patch.set_alpha(0.0)
     ax3.spines['right'].set_position(('outward', 60))
     ax3.set_ylabel('Acc/EBOPs', color='tab:green')
     line3_base = ax3.plot(
@@ -204,7 +209,7 @@ def plot_acc_ebops_vs_epochs_compare(
 
     lines = line1_base + line1_curr + line2_base + line2_curr + line3_base + line3_curr
     labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc='upper left')
+    ax1.legend(lines, labels, loc='upper center', bbox_to_anchor=(0.5, 1.02), ncol=3)
 
     plt.title('Baseline vs Current: Accuracy, EBOPs, and Efficiency (Acc/EBOPs)')
     fig.tight_layout()
@@ -473,6 +478,9 @@ def plot_bw_vs_epochs_compare(
 
     curr_bits_set = set(int(b) for b in curr_bits)
     base_bits_set = set(int(b) for b in base_bits)
+    all_bits = sorted(curr_bits_set | base_bits_set)
+    cmap = plt.get_cmap('tab10')
+    bit_color = {bit: cmap(i % 10) for i, bit in enumerate(all_bits)}
     plotted_any = False
 
     for bit in bits_to_plot:
@@ -486,6 +494,7 @@ def plot_bw_vs_epochs_compare(
                 linewidth=1.0,
                 linestyle=':',
                 alpha=0.4,
+                color=bit_color[bit],
                 label=f'baseline bw_{bit}',
                 zorder=1,
             )
@@ -499,6 +508,7 @@ def plot_bw_vs_epochs_compare(
                 linewidth=2.2,
                 linestyle='-',
                 alpha=0.95,
+                color=bit_color[bit],
                 label=f'current bw_{bit}',
                 zorder=3,
             )
