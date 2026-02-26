@@ -69,8 +69,12 @@ def plot_acc_ebops_vs_epochs(h5_file='results/training_trace.h5', output_file='r
     # plt.show()
 
 if __name__ == '__main__':
-    # result = 'results/baseline/'
-    result = 'results/ram/'
+    result = 'results/baseline/'
     h5_file = os.path.join(result, 'training_trace.h5')  # Update this path if needed
     output_file = os.path.join(result, 'acc_ebops_plot.png')
     plot_acc_ebops_vs_epochs(h5_file, output_file=output_file)
+
+    # result = 'results/ram/'
+    # h5_file = os.path.join(result, 'training_trace.h5')  # Update this path if needed
+    # output_file = os.path.join(result, 'acc_ebops_plot.png')
+    # plot_acc_ebops_vs_epochs(h5_file, output_file=output_file)

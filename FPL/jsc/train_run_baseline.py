@@ -24,7 +24,7 @@ input_folder = 'data/dataset.h5'
 output_folder = 'results/baseline/'
 batch_size = 33200
 learning_rate = 5e-3
-epochs = 20000
+epochs = 200000
 
 beta_sch_0 = 0
 beta_sch_1 = epochs // 50
@@ -65,8 +65,10 @@ if __name__ == '__main__':
             (beta_sch_2, beta_max, 'constant')
         ])
     )
-    lr_scheduler = LearningRateScheduler(cosine_decay_restarts_schedule(learning_rate, epochs))
-
+    #lr_scheduler = LearningRateScheduler(cosine_decay_restarts_schedule(learning_rate, epochs))
+    lr_sched = LearningRateScheduler(
+        cosine_decay_restarts_schedule(learning_rate, 4000, t_mul=1.0, m_mul=0.94, alpha=1e-6, alpha_steps=50)
+    )
     trace_cb = TrainingTraceToH5(
         output_dir=output_folder,
         filename="training_trace.h5",
@@ -74,7 +76,7 @@ if __name__ == '__main__':
         beta_callback=beta_sched,
     )
 
-    callbacks = [ebops_cb, pareto_cb, beta_sched, lr_scheduler, trace_cb]
+    callbacks = [ebops_cb, pareto_cb, beta_sched, lr_sched, trace_cb]
 
     opt = keras.optimizers.Adam()
     metrics = ['accuracy']
