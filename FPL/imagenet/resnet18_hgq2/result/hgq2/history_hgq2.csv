@@ -1,0 +1,2 @@
+epoch,accuracy,beta,ebops,loss,val_accuracy,val_loss
+0,0.5,5e-07,1583423748,790.0712280273438,0.5,1.1503223180770874

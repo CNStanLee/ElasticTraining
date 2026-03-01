@@ -1,0 +1,21 @@
+{
+  "final_train_acc": 0.5,
+  "final_val_acc": 0.5,
+  "final_train_loss": 790.0712280273438,
+  "final_val_loss": 1.1503223180770874,
+  "final_ebops": 1583423748.0,
+  "epochs": 1,
+  "batch_size": 4,
+  "learning_rate": 0.05,
+  "weight_decay": 0.0002,
+  "init_bw_k": 2,
+  "init_bw_a": 2,
+  "beta_max": 0.001,
+  "num_classes": 2,
+  "image_size": 64,
+  "data_root": "/tmp/imagenet_smoke",
+  "expected_classes": 2,
+  "strict_classes": true,
+  "train_subset": 16,
+  "val_subset": 8
+}

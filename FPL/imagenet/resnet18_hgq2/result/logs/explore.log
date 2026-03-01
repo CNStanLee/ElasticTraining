@@ -1,0 +1,17 @@
+2026-03-01 23:01:55.639900: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:479] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2026-03-01 23:01:55.654191: E external/local_xla/xla/stream_executor/cuda/cuda_dnn.cc:10575] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+2026-03-01 23:01:55.654232: E external/local_xla/xla/stream_executor/cuda/cuda_blas.cc:1442] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+Found 16 files belonging to 2 classes.
+Found 8 files belonging to 2 classes.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1772406122.298222   26197 service.cc:145] XLA service 0x773530003ee0 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+I0000 00:00:1772406122.298244   26197 service.cc:153]   StreamExecutor device (0): NVIDIA GeForce RTX 4070 Laptop GPU, Compute Capability 8.9
+I0000 00:00:1772406126.299457   26197 device_compiler.h:188] Compiled cluster using XLA!  This line is logged at most once for the lifetime of the process.
+[1m1/4[0m [32m━━━━━[0m[37m━━━━━━━━━━━━━━━[0m [1m22s[0m 7s/step - accuracy: 0.5000 - loss: 0.7319[1m4/4[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m9s[0m 565ms/step - accuracy: 0.5000 - loss: 7.2699 - val_accuracy: 0.5000 - val_loss: 251102784.0000
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1772406179.442620   26193 asm_compiler.cc:369] ptxas warning : Registers are spilled to local memory in function 'input_maximum_transpose_fusion_5', 4 bytes spill stores, 4 bytes spill loads
+
+[1m8/4[0m [32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m-25s[0m 6s/step - accuracy: 0.5000 - loss: 790.1000[1m4/4[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m65s[0m 16s/step - accuracy: 0.5000 - loss: 790.1000 - val_accuracy: 0.5000 - val_loss: 1.1503 - ebops: 1583488516.0000 - beta: 5.0000e-07
+Diagnostic finished. Report saved to:
+/home/changhong/prj/ElasticTraining/FPL/imagenet/resnet18_hgq2/result/explore/diagnostic_report.json
+- 当前配置下未观察到强烈异常，可尝试提高 beta_max 或增大训练轮数。

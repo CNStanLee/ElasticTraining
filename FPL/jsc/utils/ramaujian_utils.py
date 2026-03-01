@@ -45,6 +45,43 @@ def _get_kq_var(kq, name):
     return None
 
 
+def compute_per_layer_degree(
+    model: keras.Model,
+    multiplier: float = 1.5,
+    min_degree: int = 4,
+) -> dict:
+    """根据每层 kernel 的输入维度自动计算 Ramanujan 度。
+
+    公式：degree = clamp(round(sqrt(in_dim) * multiplier), min_degree, in_dim)
+
+    参数:
+        model      : Keras / HGQ 模型
+        multiplier : sqrt(in_dim) 的放大系数，保证谱间隙余量（默认 1.5）
+        min_degree : 度的下限（默认 4）
+
+    返回:
+        {layer.name: degree}，仅包含同时具备 kernel 和 kq 的 HGQ 层
+    """
+    import math
+    result = {}
+    for layer in model.layers:
+        if getattr(layer, 'kq', None) is None or not hasattr(layer, 'kernel'):
+            continue
+        shape = layer.kernel.shape
+        # Dense: (in_dim, out_dim);  Conv2D: (kh, kw, in_ch, out_ch)
+        in_dim = shape[0] if len(shape) == 2 else shape[2]
+        degree = int(round(math.sqrt(in_dim) * multiplier))
+        degree = max(degree, min_degree)
+        degree = min(degree, int(in_dim))
+        result[layer.name] = degree
+        print(
+            f'[compute_per_layer_degree] layer={layer.name}, '
+            f'in_dim={in_dim}, degree={degree}, '
+            f'sparsity={1.0 - degree / in_dim:.1%}'
+        )
+    return result
+
+
 def apply_ramanujan_init(
     model: keras.Model,
     default_degree: int = 8,
@@ -124,11 +161,23 @@ def apply_ramanujan_init(
 
 class RamanujanMaskEnforcer(keras.callbacks.Callback):
     """
-    在训练过程中持续将 kq.b / kq.i 中被剪掉连接的位宽钳制为指定值（默认 0），
-    防止 optimizer 将其从 0 更新回来，从而保持 Ramanujan 稀疏拓扑不变。
+    在训练过程中将 kq.b / kq.i 中被剪掉连接的位宽钳制为指定值（默认 0），
+    防止 optimizer 将其从 0 更新回来，从而保持 Ramanujan 稀疏拓扑。
+
+    支持两种模式：
+    - 强制模式（release_epoch=None）：始终强制，拓扑完全固定（原始行为）。
+    - 渐进放开模式（release_epoch 指定）：
+        * [0, release_epoch)：每 batch 强制，拓扑完全固定（warmup 阶段）。
+        * [release_epoch, release_epoch + fade_epochs)：按线性衰减概率施加约束，
+          允许梯度逐渐"修复"初始随机拓扑中次优的连接。
+        * [release_epoch + fade_epochs, ∞)：完全放开，HGQ 自由学习稀疏结构。
+
+    推荐设置：
+        release_epoch = warmup_end_epoch（= beta_sch_1）
+        fade_epochs   = total_epochs // 5  （渐进窗口）
 
     用法（在 train_run_ram.py 里加入 callbacks）：
-        enforcer = RamanujanMaskEnforcer()
+        enforcer = RamanujanMaskEnforcer(release_epoch=1200, fade_epochs=2400)
         callbacks = [..., enforcer]
     """
 
@@ -137,13 +186,35 @@ class RamanujanMaskEnforcer(keras.callbacks.Callback):
         layer_names=None,
         enforce_frac_bits: float = 0.0,
         enforce_int_bits: float = 0.0,
+        release_epoch: int | None = None,
+        fade_epochs: int = 0,
     ):
         super().__init__()
         self.layer_names = set(layer_names) if layer_names is not None else None
         self.enforce_frac_bits = enforce_frac_bits
         self.enforce_int_bits = enforce_int_bits
+        self.release_epoch = release_epoch
+        self.fade_epochs = max(fade_epochs, 1)
+        self._current_epoch = 0
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self._current_epoch = epoch
+
+    def _enforce_strength(self) -> float:
+        """返回 [0, 1] 的约束强度：1=完全固定，0=完全放开。"""
+        if self.release_epoch is None:
+            return 1.0
+        epoch = self._current_epoch
+        if epoch < self.release_epoch:
+            return 1.0
+        progress = (epoch - self.release_epoch) / self.fade_epochs
+        return max(0.0, 1.0 - progress)
 
     def on_train_batch_end(self, batch, logs=None):
+        strength = self._enforce_strength()
+        if strength <= 0.0:
+            return  # 完全放开，不干预
+
         for layer in self.model.layers:
             mask = getattr(layer, "ramanujan_mask", None)
             if mask is None:
@@ -160,11 +231,20 @@ class RamanujanMaskEnforcer(keras.callbacks.Callback):
             b_var = _get_kq_var(kq, "b")
             if b_var is not None:
                 b_arr = b_var.numpy()
-                b_arr = np.where(pruned > 0, self.enforce_frac_bits, b_arr)
+                if strength >= 1.0:
+                    b_arr = np.where(pruned > 0, self.enforce_frac_bits, b_arr)
+                else:
+                    # 线性插值：渐进放开
+                    target = np.where(pruned > 0, self.enforce_frac_bits, b_arr)
+                    b_arr = strength * target + (1.0 - strength) * b_arr
                 b_var.assign(b_arr)
 
             i_var = _get_kq_var(kq, "i")
             if i_var is not None:
                 i_arr = i_var.numpy()
-                i_arr = np.where(pruned > 0, self.enforce_int_bits, i_arr)
+                if strength >= 1.0:
+                    i_arr = np.where(pruned > 0, self.enforce_int_bits, i_arr)
+                else:
+                    target = np.where(pruned > 0, self.enforce_int_bits, i_arr)
+                    i_arr = strength * target + (1.0 - strength) * i_arr
                 i_var.assign(i_arr)

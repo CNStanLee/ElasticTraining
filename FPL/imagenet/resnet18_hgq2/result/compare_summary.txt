@@ -1,0 +1,7 @@
+=== Experiment Summary ===
+fp32 val_acc: 0.5
+hgq2 val_acc: 0.5
+val_acc gap (fp32-hgq2): 0.0
+hgq2 final ebops: 1583423748.0
+findings:
+- 当前配置下未观察到强烈异常，可尝试提高 beta_max 或增大训练轮数。

@@ -1,0 +1,32 @@
+2026-03-01 23:00:28.552294: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:479] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2026-03-01 23:00:28.566056: E external/local_xla/xla/stream_executor/cuda/cuda_dnn.cc:10575] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+2026-03-01 23:00:28.566092: E external/local_xla/xla/stream_executor/cuda/cuda_blas.cc:1442] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+Found 16 files belonging to 2 classes.
+Found 8 files belonging to 2 classes.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1772406035.376305   24666 service.cc:145] XLA service 0x764dd800b2d0 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+I0000 00:00:1772406035.376343   24666 service.cc:153]   StreamExecutor device (0): NVIDIA GeForce RTX 4070 Laptop GPU, Compute Capability 8.9
+I0000 00:00:1772406039.477555   24666 device_compiler.h:188] Compiled cluster using XLA!  This line is logged at most once for the lifetime of the process.
+[1m1/4[0m [32m━━━━━[0m[37m━━━━━━━━━━━━━━━[0m [1m22s[0m 8s/step - accuracy: 0.5000 - loss: 1.0256
+Epoch 1: val_accuracy improved from None to 0.50000, saving model to /home/changhong/prj/ElasticTraining/FPL/imagenet/resnet18_hgq2/result/fp32/best_fp32.keras
+
+Epoch 1: finished saving model to /home/changhong/prj/ElasticTraining/FPL/imagenet/resnet18_hgq2/result/fp32/best_fp32.keras
+[1m4/4[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m8s[0m 311ms/step - accuracy: 0.4375 - loss: 7.1115 - val_accuracy: 0.5000 - val_loss: 3669323.5000
+Training finished. Summary:
+{
+  "final_train_acc": 0.4375,
+  "final_val_acc": 0.5,
+  "final_train_loss": 7.111490726470947,
+  "final_val_loss": 3669323.5,
+  "epochs": 1,
+  "batch_size": 4,
+  "learning_rate": 0.1,
+  "weight_decay": 0.0001,
+  "num_classes": 2,
+  "image_size": 64,
+  "data_root": "/tmp/imagenet_smoke",
+  "expected_classes": 2,
+  "strict_classes": true,
+  "train_subset": 16,
+  "val_subset": 8
+}

@@ -16,6 +16,94 @@ from hgq.layers import QLayerBase
 from keras import ops
 from math import cos, pi
 
+class EBOPsAdaptiveBeta(keras.callbacks.Callback):
+    """
+    在 warmup 结束后，动态调整 beta 使 EBOPs 在 total_epochs 结束时趋近于 0。
+
+    时序设计（关键）
+    ----------------
+    错误做法：在 on_epoch_end 写 layer._beta
+              → BetaScheduler.on_epoch_begin 在下一 epoch 开始时立刻覆盖，boost 无效。
+
+    正确做法：
+      - on_epoch_end   : 读当前 EBOPs，计算目标 beta，存入 self._next_beta
+      - on_epoch_begin : （排在 BetaScheduler 之后）用 self._next_beta 覆盖写入 layer._beta
+
+    参数
+    ----
+    beta_scheduler   : 原有的 BetaScheduler 实例
+    warmup_end_epoch : beta 开始上升的 epoch（= beta_sch_1）
+    total_epochs     : 训练总 epoch
+    beta_hard_max    : beta 绝对上限（建议 1e-1，12000 epoch 内压到 0 需要足够大）
+    boost_power      : 超额比例指数，越大越激进（建议 0.5~1.0）
+    target_ebops     : 最终目标 EBOPs，默认 0
+    """
+
+    def __init__(
+        self,
+        beta_scheduler,
+        warmup_end_epoch: int,
+        total_epochs: int,
+        beta_hard_max: float = 1e-1,
+        boost_power: float = 0.7,
+        target_ebops: float = 0.0,
+    ):
+        super().__init__()
+        self.beta_scheduler = beta_scheduler
+        self.warmup_end_epoch = warmup_end_epoch
+        self.total_epochs = total_epochs
+        self.beta_hard_max = beta_hard_max
+        self.boost_power = boost_power
+        self.target_ebops = target_ebops
+        self._ebops_at_warmup_end = None
+        self._next_beta = None  # on_epoch_end 计算，on_epoch_begin 施加
+
+    def _assign_beta(self, beta_value):
+        """直接写入所有量化层的 _beta 变量。"""
+        from keras import ops
+        for layer in self.model._flatten_layers():
+            if hasattr(layer, '_beta'):
+                layer._beta.assign(
+                    ops.convert_to_tensor(beta_value, dtype=layer._beta.dtype)
+                )
+
+    def on_epoch_begin(self, epoch, logs=None):
+        """BetaScheduler 先赋值后本 callback 覆盖——须排在 callbacks 列表 BetaScheduler 之后。"""
+        if self._next_beta is not None:
+            self._assign_beta(self._next_beta)
+
+    def on_epoch_end(self, epoch, logs=None):
+        """读取本 epoch EBOPs，计算下一个 epoch 应施加的 beta。"""
+        logs = logs or {}
+        if epoch < self.warmup_end_epoch:
+            return
+
+        current_ebops = float(logs.get('ebops', float('nan')))
+        if current_ebops != current_ebops:  # nan check
+            return
+
+        if self._ebops_at_warmup_end is None:
+            self._ebops_at_warmup_end = max(current_ebops, 1.0)
+
+        compress_span = self.total_epochs - self.warmup_end_epoch
+        elapsed = epoch - self.warmup_end_epoch
+        progress = min(elapsed / max(compress_span, 1), 1.0)
+
+        ebops_range = self._ebops_at_warmup_end - self.target_ebops
+        target = self._ebops_at_warmup_end - ebops_range * progress
+
+        beta_scheduled = float(self.beta_scheduler.beta_fn(epoch))
+
+        if target <= 0 or current_ebops <= target:
+            self._next_beta = None
+            return
+
+        surplus_ratio = current_ebops / max(target, 1e-6)
+        beta_boosted = beta_scheduled * (surplus_ratio ** self.boost_power)
+        self._next_beta = min(beta_boosted, self.beta_hard_max)
+        logs['beta_adaptive'] = self._next_beta
+
+
 def cosine_decay_restarts_schedule(
     initial_learning_rate: float, first_decay_steps: int, t_mul=1.0, m_mul=1.0, alpha=0.0, alpha_steps=0
 ):
@@ -212,3 +300,75 @@ class TrainingTraceToH5(keras.callbacks.Callback):
         except Exception:
             # don't crash training if disk write fails
             pass
+
+
+class GradientNormLogger(keras.callbacks.Callback):
+    """每隔若干 epoch 计算并打印（及可选写入 h5）各层 kernel 的梯度 L2 范数。
+
+    用于验证 HGQ 深层网络的梯度消失 / 爆炸问题：
+      - 梯度范数随层序号单调递减 → 梯度消失（靠近输入的层学不到东西）
+      - 梯度范数随层序号单调递增 → 梯度爆炸
+
+    HGQ 特有现象：
+      当某层 kq.b（小数位宽）被压到接近 0 时，STE 的有效缩放因子趋近 0，
+      该层以前的所有层都收不到任何梯度 —— 即使层数不多也会出现"量化梯度消失"。
+
+    参数:
+        log_every   : 每隔多少 epoch 记录一次（默认 100）
+        output_path : h5 文件路径，None 则只打印不存储
+        tape_batch  : 用于计算梯度的批次数（默认 1，节省时间）
+    """
+
+    def __init__(self, dataset_for_grad, log_every: int = 100, output_path: str | None = None):
+        super().__init__()
+        self.dataset_for_grad = dataset_for_grad  # 传入一个小批次 (X, y) 或 tf.data batch
+        self.log_every = log_every
+        self.output_path = output_path
+        self._records = {}   # {layer_name: [norm_epoch0, norm_epoch1, ...]}
+        self._epochs  = []
+
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch % self.log_every != 0:
+            return
+
+        # 取一个 batch 计算梯度（始终用 sparse CE，避免 compiled_loss 跨 Keras 版本问题）
+        x, y = self.dataset_for_grad
+        with tf.GradientTape() as tape:
+            y_pred = self.model(x, training=True)
+            loss = tf.reduce_mean(
+                keras.losses.sparse_categorical_crossentropy(y, y_pred, from_logits=True)
+            )
+
+        grads = tape.gradient(loss, self.model.trainable_variables)
+
+        # 按层汇总 kernel 梯度范数（用 id() 作 key，兼容 Keras 3 / TF2 所有版本）
+        var_to_grad = {id(v): g for v, g in zip(self.model.trainable_variables, grads) if g is not None}
+
+        print(f"\n[GradientNormLogger] epoch={epoch}")
+        self._epochs.append(epoch)
+        for layer in self.model.layers:
+            if not hasattr(layer, 'kernel'):
+                continue
+            if id(layer.kernel) not in var_to_grad:
+                continue
+            norm = float(tf.norm(var_to_grad[id(layer.kernel)]).numpy())
+            print(f"  {layer.name:12s}  kernel grad norm = {norm:.4e}")
+            if layer.name not in self._records:
+                self._records[layer.name] = []
+            self._records[layer.name].append(norm)
+
+        # 可选写入 h5
+        if self.output_path is not None:
+            try:
+                with h5py.File(self.output_path, 'a') as hf:
+                    hf.require_dataset('epochs', shape=(0,), maxshape=(None,), dtype=np.int32)
+                    for name, norms in self._records.items():
+                        key = f'grad_norm/{name}'
+                        ds = hf.require_dataset(key, shape=(0,), maxshape=(None,), dtype=np.float32)
+                        ds.resize(len(norms), axis=0)
+                        ds[:] = norms
+                    ep_ds = hf['epochs']
+                    ep_ds.resize(len(self._epochs), axis=0)
+                    ep_ds[:] = self._epochs
+            except Exception:
+                pass
