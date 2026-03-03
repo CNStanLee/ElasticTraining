@@ -525,6 +525,7 @@ if __name__ == '__main__':
 
     # result = 'results/baseline/'
     result = 'results/ram_init/'
+    # result = 'results/prune_finetune_3000/'
     h5_file = os.path.join(result, 'training_trace.h5')  # Update this path if needed
     baseline_h5_file = os.path.join(baseline_result, 'training_trace.h5')
     output_acc_ebops = os.path.join(result, 'aaa_acc_ebops_plot.png')
