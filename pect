@@ -1,0 +1,3 @@
+Help on function trace_model in module da4ml.converter:
+
+ttrraaccee__mmooddeell(model: collections.abc.Callable, hwconf: da4ml.trace.fixed_variable.HWConfig | tuple[int, int, int] = HWConfig(adder_size=1, carry_size=-1, latency_cutoff=-1), solver_options: da4ml.cmvm.api.solver_options_t | None = None, verbose: bool = False, inputs: tuple[da4ml.trace.fixed_variable_array.FixedVariableArray, ...] | None = None, inputs_kif: tuple[int, int, int] | None = None, dump=False)
