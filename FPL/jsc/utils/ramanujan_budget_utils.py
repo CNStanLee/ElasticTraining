@@ -299,317 +299,6 @@ def apply_ramanujan_bw_init(
 
 
 # ---------------------------------------------------------------------------
-# 3D Ramanujan Allocation — per-connection bitwidth optimization
-# ---------------------------------------------------------------------------
-
-def compute_3d_ramanujan_allocation(
-    model: keras.Model,
-    target_ebops: float,
-    b_a_init: float = 3.0,
-    b_k_viable: float = 1.0,
-    b_k_max: float = 6.0,
-    init_bk: float | None = None,
-    base_multiplier: float = 2.0,
-    min_per_layer: int = 5,
-    budget_weight: str = 'capacity',
-    seed: int = 42,
-    verbose: bool = True,
-) -> dict[str, np.ndarray]:
-    """3D Ramanujan graph init: per-connection bitwidth allocation under EBOPS budget.
-
-    核心思路
-    --------
-    标准 Ramanujan 初始化用 d-regular 拓扑 + 均匀位宽，在极低 EBOPS 预算下
-    所有连接的位宽都太低（< 1 bit, ~0.1）导致 STE 梯度全是噪声、无法训练。
-
-    本方法将预算 **集中** 到少量高重要性连接上，使每条存活连接都有足够位宽
-    (≥ b_k_viable) 进行有效训练，同时放弃低价值连接。
-
-    "三维" 指联合优化三个维度：
-      1. 深度维（层）  : 保证每层至少 min_per_layer 条活跃连接（梯度流贯通）
-      2. 宽度维（神经元）: 在层内按 |kernel| 重要性分数选择哪些连接存活
-      3. 精度维（位宽）  : 存活连接按重要性非均匀分配 b_k ∈ [b_k_viable, b_k_max]
-
-    两阶段策略（init_bk 不为 None 时）
-    ----------------------------------
-    **拓扑选择** 仍基于 target_ebops 预算（决定存活连接数量），但实际写入的
-    b_k = init_bk（通常 = 模型原始位宽，如 3.0），使初始 EBOPS > target。
-    训练时由 BetaOnlyBudgetController 自然压缩到 target_ebops。
-    这样保证：
-      - 初始拓扑来自 Ramanujan 谱优选（连接质量）
-      - 初始位宽足够高，Glorot 权重不会被量化为全 0（可训练性）
-      - 渐进压缩沿用 baseline 经验证的路径（梯度自然分配位宽）
-
-    参数
-    ----
-    b_k_viable       : 拓扑选择时的计算位宽（决定存活数量），建议 ≥ 1.0
-    b_k_max          : 最高位宽上限（仅在 init_bk=None 时用于非均匀分配）
-    init_bk          : 存活连接的实际初始 b_k。
-                       None → 用预算优化的非均匀位宽（可能很低）。
-                       float → 所有存活连接统一设为此值（推荐 = 模型原始 f0）。
-    base_multiplier  : 基础 Ramanujan 度 = round(sqrt(N_in) * mult)
-    min_per_layer    : 每层至少保留的连接数
-    budget_weight    : 'capacity' (按 N_in*N_out 加权) | 'uniform'
-
-    返回
-    ----
-    per_layer_bk_map : dict {layer_name: ndarray[float32] 形状同 kernel}
-        每个元素 = 该连接的 b_k（0 = 被剪, > 0 = 存活）
-    """
-    rng = np.random.RandomState(seed)
-
-    # ── Phase 1: 收集层信息 + 生成基础 Ramanujan 掩膜 ────────────────────
-    layers_info = []
-    for layer in _flatten_layers(model):
-        if getattr(layer, 'kq', None) is None or not hasattr(layer, 'kernel'):
-            continue
-        shape = layer.kernel.shape
-        kernel_np = layer.kernel.numpy()
-
-        if len(shape) == 2:
-            in_dim, out_dim = int(shape[0]), int(shape[1])
-            conn_mul = 1
-            deg_base = in_dim
-        elif len(shape) == 4:
-            kh, kw, in_ch, out_ch = [int(x) for x in shape]
-            conn_mul = kh * kw
-            in_dim, out_dim = in_ch, out_ch
-            deg_base = in_ch
-        else:
-            continue
-
-        d_l = int(round(math.sqrt(deg_base) * base_multiplier))
-        d_l = max(d_l, min(2, deg_base))
-        d_l = min(d_l, deg_base)
-
-        mask = _ramanujan_like_mask(shape, d_l, rng)
-        layers_info.append({
-            'name': layer.name, 'layer': layer, 'shape': shape,
-            'in_dim': in_dim, 'out_dim': out_dim,
-            'd_l': d_l, 'conn_mul': conn_mul,
-            'mask': mask, 'kernel_np': kernel_np,
-        })
-
-    if not layers_info:
-        raise ValueError("No HGQ layers with kq found in model.")
-
-    # ── Phase 2: 按 |kernel| 为候选连接打分 ─────────────────────────────
-    for info in layers_info:
-        k = info['kernel_np']
-        m = info['mask']
-        if len(info['shape']) == 4:
-            # Conv: 聚合空间维 → (in_ch, out_ch) 分数
-            scores = (np.abs(k).sum(axis=(0, 1))
-                      * (m.sum(axis=(0, 1)) > 0).astype(np.float32))
-        else:
-            scores = np.abs(k) * m
-        info['scores_2d'] = scores        # (in_dim, out_dim)
-
-    # ── Phase 3: 按层分配 EBOPS 预算（保底 + 容量加权）──────────────────
-    if budget_weight == 'capacity':
-        caps = [info['in_dim'] * info['out_dim'] for info in layers_info]
-    else:
-        caps = [1.0] * len(layers_info)
-    total_cap = sum(caps)
-
-    floor_budget = min_per_layer * b_k_viable * b_a_init
-    total_floor  = floor_budget * len(layers_info)
-    if total_floor > target_ebops * 0.95:
-        min_per_layer = max(1, int(
-            target_ebops * 0.95 / (len(layers_info) * b_k_viable * b_a_init)))
-        floor_budget = min_per_layer * b_k_viable * b_a_init
-        total_floor  = floor_budget * len(layers_info)
-
-    distributable = target_ebops - total_floor
-    budgets = [floor_budget + distributable * (c / total_cap) for c in caps]
-
-    # ── Phase 4: 逐层剪枝 + 非均匀位宽分配 ──────────────────────────────
-    per_layer_bk_map = {}
-    actual_total = 0.0
-
-    if verbose:
-        print(f"\n[3D-Ramanujan] target_ebops={target_ebops:.1f}, "
-              f"b_k_viable={b_k_viable}, b_k_max={b_k_max}, "
-              f"b_a_init={b_a_init}")
-        print(f"  {'layer':12s}  {'budget':>8s}  {'d_base':>6s}  "
-              f"{'n_cand':>6s}  {'n_surv':>6s}  "
-              f"{'mean_bk':>8s}  {'max_bk':>7s}  {'E_est':>8s}")
-
-    for info, budget_l in zip(layers_info, budgets):
-        layer  = info['layer']
-        shape  = info['shape']
-        mask   = info['mask']
-        scores = info['scores_2d']
-        cm     = info['conn_mul']
-        in_dim, out_dim = info['in_dim'], info['out_dim']
-
-        # 活跃候选（channel 级别）
-        if len(shape) == 4:
-            ch_mask = (mask.sum(axis=(0, 1)) > 0).astype(np.float32)
-        else:
-            ch_mask = (mask > 0).astype(np.float32)
-        active_pos = np.argwhere(ch_mask > 0)   # [(i, j), ...]
-        n_active = len(active_pos)
-
-        # 预算内可存活的最大连接数
-        ebops_per_conn = b_k_viable * b_a_init * cm
-        n_max = max(min_per_layer, int(budget_l / ebops_per_conn))
-
-        # 按分数排序，保留 top n_max
-        if n_active <= n_max:
-            surv_pos = active_pos
-        else:
-            pos_sc  = np.array([scores[i, j] for i, j in active_pos])
-            top_idx = np.argsort(-pos_sc)[:n_max]
-            surv_pos = active_pos[top_idx]
-        n_survive = len(surv_pos)
-
-        # ── 位宽分配：base = b_k_viable，富余按重要性加权 ────────────
-        surv_sc = np.array([scores[i, j] for i, j in surv_pos])
-        sc_sum  = surv_sc.sum()
-        sc_frac = (surv_sc / sc_sum if sc_sum > 0
-                   else np.ones(n_survive) / max(n_survive, 1))
-
-        if init_bk is not None:
-            # 两阶段策略：拓扑由预算决定，位宽固定为 init_bk
-            bk_arr = np.full(n_survive, float(init_bk), dtype=np.float32)
-        else:
-            # 原始策略：位宽也由预算约束
-            bk_arr    = np.full(n_survive, b_k_viable, dtype=np.float32)
-            base_cost = n_survive * ebops_per_conn
-            extra     = max(0.0, budget_l - base_cost)
-            if extra > 0 and n_survive > 0:
-                bk_arr = bk_arr + extra * sc_frac / (b_a_init * cm)
-                bk_arr = np.clip(bk_arr, b_k_viable, b_k_max).astype(np.float32)
-
-        # 构建全形状 b_k 图
-        if len(shape) == 2:
-            bk_map = np.zeros(shape, dtype=np.float32)
-            for idx, (i, j) in enumerate(surv_pos):
-                bk_map[i, j] = bk_arr[idx]
-        else:   # 4-D Conv
-            bk_base = np.zeros((in_dim, out_dim), dtype=np.float32)
-            for idx, (i, j) in enumerate(surv_pos):
-                bk_base[i, j] = bk_arr[idx]
-            bk_map = np.broadcast_to(
-                bk_base[np.newaxis, np.newaxis], shape
-            ).copy().astype(np.float32)
-
-        ebops_est = float(bk_arr.sum()) * b_a_init * cm
-        actual_total += ebops_est
-        per_layer_bk_map[layer.name] = bk_map
-
-        if verbose:
-            m_bk = float(bk_arr.mean()) if n_survive else 0.0
-            x_bk = float(bk_arr.max())  if n_survive else 0.0
-            print(f"  {layer.name:12s}  {budget_l:8.1f}  "
-                  f"{info['d_l']:6d}  {n_active:6d}  {n_survive:6d}  "
-                  f"{m_bk:8.3f}  {x_bk:7.3f}  {ebops_est:8.1f}")
-
-    if verbose:
-        print(f"  {'TOTAL':12s}  {target_ebops:8.1f}  {'':6s}  {'':6s}  "
-              f"{'':6s}  {'':8s}  {'':7s}  {actual_total:8.1f}")
-        if init_bk is not None:
-            print(f"  init_bk={init_bk} (initial EBOPS={actual_total:.0f}, "
-                  f"target={target_ebops:.0f}, beta controller will compress)")
-        print(f"  ratio = {actual_total / target_ebops:.3f}\n")
-
-    return per_layer_bk_map
-
-
-def apply_3d_ramanujan_init(
-    model: keras.Model,
-    per_layer_bk_map: dict[str, np.ndarray],
-    active_int_bits: float = 1.0,
-    pruned_int_bits: float = 0.0,
-    pruned_frac_bits: float = 0.0,
-    also_zero_kernel: bool = True,
-    rescale_kernel: bool = True,
-    verbose: bool = True,
-):
-    """将 compute_3d_ramanujan_allocation 的 b_k map 写入模型。
-
-    对每个层：
-      kq.b[i,j] = bk_map[i,j]           (0 → 被剪, ≥ b_k_viable → 存活)
-      kq.i[i,j] = active/pruned_int_bits (按存活/剪除区分)
-      kernel[i,j] *= (bk_map > 0)        (清零被剪连接的浮点 kernel)
-      layer.ramanujan_mask = (bk_map > 0) (供 RamanujanMaskEnforcer 使用)
-
-    rescale_kernel : 若存活连接的 kernel stddev 相对于量化步长过小
-        (stddev < step * 0.5)，适当放大使权重不会全被量化为 0。
-        这是从头训练+稀疏+低位宽场景的关键保障。
-    """
-    for layer in _flatten_layers(model):
-        bk_map = per_layer_bk_map.get(layer.name)
-        if bk_map is None:
-            continue
-
-        kq = getattr(layer, 'kq', None)
-        if kq is None:
-            continue
-
-        kernel_var = layer.kernel
-        mask   = (bk_map > 0).astype(np.float32)
-        pruned = 1.0 - mask
-
-        # ── kq.b / kq.f: 写入逐连接位宽 ────────────────────────────────
-        b_var = _get_kq_var(kq, 'b')
-        f_var = _get_kq_var(kq, 'f')
-        target_var = b_var if b_var is not None else f_var
-        if target_var is not None:
-            target_var.assign(
-                (bk_map + pruned * pruned_frac_bits).astype(np.float32))
-
-        # ── kq.i: 整数位宽 ──────────────────────────────────────────────
-        i_var = _get_kq_var(kq, 'i')
-        if i_var is not None:
-            i_new = mask * active_int_bits + pruned * pruned_int_bits
-            i_var.assign(i_new.astype(np.float32))
-
-        # ── 清零被剪 kernel ──────────────────────────────────────────────
-        if also_zero_kernel:
-            kernel_var.assign(kernel_var.numpy() * mask)
-
-        # ── 量化感知 kernel 重缩放 ──────────────────────────────────────
-        if rescale_kernel:
-            active_bk = bk_map[bk_map > 0]
-            if len(active_bk) > 0:
-                mean_step = float(2.0 ** (-active_bk.mean()))
-                k_np = kernel_var.numpy()
-                active_vals = k_np[mask > 0]
-                if len(active_vals) > 0:
-                    current_std = float(np.std(active_vals))
-                    # 若 kernel stddev < 1.5 倍量化步长，放大以覆盖多个量化级
-                    target_std = mean_step * 3.0
-                    if current_std < mean_step * 1.5 and current_std > 1e-9:
-                        scale = target_std / current_std
-                        k_np = k_np * mask * scale  # 只缩放存活连接
-                        kernel_var.assign(k_np.astype(np.float32))
-                        if verbose:
-                            print(f"    [rescale] {layer.name}: "
-                                  f"std {current_std:.4f} → {target_std:.4f} "
-                                  f"(×{scale:.2f}, step={mean_step:.4f})")
-
-        # ── 挂载 mask 给 RamanujanMaskEnforcer ──────────────────────────
-        layer.ramanujan_mask = tf.constant(mask, dtype=tf.float32)
-
-        if verbose:
-            n_active = int(mask.sum())
-            n_total  = int(mask.size)
-            active_bk = bk_map[bk_map > 0]
-            if len(active_bk) > 0:
-                print(f"  [3D-RamInit] {layer.name:12s}  "
-                      f"shape={list(kernel_var.shape)}  "
-                      f"active={n_active}/{n_total} "
-                      f"({n_active / n_total:.1%})  "
-                      f"bk: mean={active_bk.mean():.3f}  "
-                      f"min={active_bk.min():.3f}  "
-                      f"max={active_bk.max():.3f}")
-            else:
-                print(f"  [3D-RamInit] {layer.name:12s}  ALL PRUNED")
-
-
-# ---------------------------------------------------------------------------
 # EBOPsConstantProjector  — Phase-2 恒 EBOPS callback
 # ---------------------------------------------------------------------------
 
@@ -998,8 +687,6 @@ class BetaOnlyBudgetController(keras.callbacks.Callback):
     同时保持最优的 per-layer 位宽分配。
 
     本 callback 复制这个机制：
-    - warmup 阶段（epoch < warmup_epochs）不介入，让 BetaScheduler 控制
-    - warmup 结束后，从 BetaScheduler 当前值接管
     - 当 EBOPs > target * (1 + margin) 时，自适应增大 beta 施加压缩力
     - 当 EBOPs < target * (1 - margin) 时，减小 beta 释放压力
     - 当 EBOPs 在容忍带内时，保持 beta 不变
@@ -1012,47 +699,33 @@ class BetaOnlyBudgetController(keras.callbacks.Callback):
     参数
     ----
     target_ebops    : 目标 EBOPS
-    warmup_epochs   : warmup 期间不介入（让 BetaScheduler 控制），之后再开始调控
-    margin          : 容忍带宽度（默认 0.15 = ±15%）
+    margin          : 容忍带宽度（默认 0.1 = ±10%）
+    beta_init       : 初始 beta（默认 1e-5）
     beta_min        : beta 下限
     beta_max        : beta 上限
-    adjust_factor   : 基础乘法调整因子（默认 1.15）
-    max_step_factor : 单步最大乘法因子上限（默认 1.5），防止 beta 暴涨
+    adjust_factor   : 每次超标时 beta 的乘法调整因子（默认 1.3）
     ema_alpha       : EBOPS EMA 平滑系数
     """
 
     def __init__(
         self,
         target_ebops: float,
-        warmup_epochs: int = 0,
-        margin: float = 0.15,
-        beta_min: float = 1e-8,
+        margin: float = 0.1,
+        beta_init: float = 1e-5,
+        beta_min: float = 1e-7,
         beta_max: float = 1e-3,
-        adjust_factor: float = 1.15,
-        max_step_factor: float = 1.5,
+        adjust_factor: float = 1.3,
         ema_alpha: float = 0.3,
     ):
         super().__init__()
-        self.target_ebops    = float(target_ebops)
-        self.warmup_epochs   = warmup_epochs
-        self.margin          = margin
-        self.beta_current    = None  # 将从 BetaScheduler 值接管
-        self.beta_min        = beta_min
-        self.beta_max        = beta_max
-        self.adjust_factor   = adjust_factor
-        self.max_step_factor = max_step_factor
-        self.ema_alpha       = ema_alpha
-        self._ebops_ema      = None
-
-    def _read_beta(self):
-        """从模型当前 _beta 变量读取 beta 值。"""
-        for layer in _flatten_layers(self.model):
-            if hasattr(layer, '_beta'):
-                try:
-                    return float(layer._beta.numpy().flat[0])
-                except Exception:
-                    pass
-        return 1e-6
+        self.target_ebops  = float(target_ebops)
+        self.margin        = margin
+        self.beta_current  = float(beta_init)
+        self.beta_min      = beta_min
+        self.beta_max      = beta_max
+        self.adjust_factor = adjust_factor
+        self.ema_alpha     = ema_alpha
+        self._ebops_ema    = None
 
     def _set_beta(self, value):
         bv = tf.constant(value, dtype=tf.float32)
@@ -1064,26 +737,13 @@ class BetaOnlyBudgetController(keras.callbacks.Callback):
                     pass
 
     def on_epoch_begin(self, epoch, logs=None):
-        # warmup 阶段不介入，让 BetaScheduler 控制 beta
-        if epoch < self.warmup_epochs:
-            return
-        # 首次接管：从 BetaScheduler 已设置的值初始化
-        if self.beta_current is None:
-            self.beta_current = self._read_beta()
         self._set_beta(self.beta_current)
 
     def on_epoch_end(self, epoch, logs=None):
-        # warmup 阶段不调整
-        if epoch < self.warmup_epochs:
-            return
         logs = logs or {}
         raw_ebops = float(logs.get('ebops', float('nan')))
         if not math.isfinite(raw_ebops) or raw_ebops <= 0:
             return
-
-        # 首次接管时，也读取当前 beta 以防 on_epoch_begin 没执行
-        if self.beta_current is None:
-            self.beta_current = self._read_beta()
 
         if self._ebops_ema is None:
             self._ebops_ema = raw_ebops
@@ -1095,180 +755,20 @@ class BetaOnlyBudgetController(keras.callbacks.Callback):
         lower = self.target_ebops * (1.0 - self.margin)
 
         if self._ebops_ema > upper:
-            # EBOPs 超标 → 增大 beta，按超额比例加速，但限制单步幅度
+            # EBOPs 超标 → 增大 beta 施加压缩力，按超额比例加速
             overshoot = self._ebops_ema / upper
-            factor = min(self.adjust_factor * overshoot, self.max_step_factor)
             self.beta_current = min(
-                self.beta_current * factor,
+                self.beta_current * self.adjust_factor * overshoot,
                 self.beta_max,
             )
         elif self._ebops_ema < lower:
-            # EBOPs 不足 → 减小 beta 释放压力，同样限制单步幅度
+            # EBOPs 不足 → 大幅减小 beta 释放压力
+            # 按不足比例加速衰减：越低于目标，beta 降得越快
             undershoot = lower / max(self._ebops_ema, 1.0)
-            factor = min(self.adjust_factor * undershoot, self.max_step_factor)
             self.beta_current = max(
-                self.beta_current / factor,
+                self.beta_current / (self.adjust_factor * undershoot),
                 self.beta_min,
             )
         # else: 在容忍带内，保持不变
 
         logs['beta_budget'] = self.beta_current
-
-
-# ---------------------------------------------------------------------------
-# 结构化剪枝：从 baseline 高精度 checkpoint 剪到 target EBOPS
-# ---------------------------------------------------------------------------
-
-def structured_prune_for_budget(
-    model: keras.Model,
-    target_ebops: float,
-    b_a: float = 3.0,
-    init_bk: float = 3.0,
-    min_per_layer: int = 5,
-    budget_weight: str = 'capacity',
-    verbose: bool = True,
-) -> dict[str, np.ndarray]:
-    """从已训练模型中选择最重要的连接，保留高位宽，其余清零。
-
-    与均匀缩放剪枝（SensitivityAwarePruner）的关键区别
-    ------------------------------------------------
-    均匀缩放：所有连接 b_k *= α → 全部变成 ~0.04 → STE 梯度全死
-    结构化剪枝：选 ~100 条最重要的连接保留 b_k=3.0，其余 b_k=0 → 可训练
-
-    重要性评分
-    ----------
-    每条连接的重要性 = |kernel[i,j]| × b_k[i,j]
-    这衡量了该连接在当前模型中的信息传递能力：
-      - |kernel| 大 → 权重本身重要
-      - b_k 大 → 量化精度高，传递的信息保真度高
-    baseline 训练过程中，梯度已经自然地将重要性集中到少量连接上，
-    这个分数恰好捕捉了这一分布。
-
-    参数
-    ----
-    model        : 已训练的 HGQ 模型（含 kq.b 和 kernel）
-    target_ebops : 目标 EBOPS 预算
-    b_a          : 激活量化位宽（用于计算 EBOPS = b_k × b_a）
-    init_bk      : 存活连接的初始 b_k（通常 = 模型训练时的 f0）
-    min_per_layer: 每层至少保留的连接数（保证梯度流贯通）
-    budget_weight: 'capacity'（按 N_in × N_out 加权）| 'uniform'
-
-    返回
-    ----
-    per_layer_bk_map : dict {layer_name: ndarray[float32] 同 kernel 形状}
-    """
-    # ── 收集层信息 ─────────────────────────────────────────────────────
-    layers_info = []
-    for layer in _flatten_layers(model):
-        kq = getattr(layer, 'kq', None)
-        if kq is None or not hasattr(layer, 'kernel'):
-            continue
-        shape = layer.kernel.shape
-        kernel_np = layer.kernel.numpy()
-
-        b_var = _get_kq_var(kq, 'b')
-        if b_var is None:
-            b_var = _get_kq_var(kq, 'f')
-        bk_np = b_var.numpy() if b_var is not None else np.ones(shape, dtype=np.float32)
-
-        if len(shape) == 2:
-            in_dim, out_dim = int(shape[0]), int(shape[1])
-            conn_mul = 1
-        elif len(shape) == 4:
-            kh, kw, in_ch, out_ch = [int(x) for x in shape]
-            conn_mul = kh * kw
-            in_dim, out_dim = in_ch, out_ch
-        else:
-            continue
-
-        # 重要性 = |kernel| × b_k，2D 形式 (in_dim, out_dim)
-        if len(shape) == 4:
-            scores = (np.abs(kernel_np) * np.maximum(bk_np, 0)).sum(axis=(0, 1))
-        else:
-            scores = np.abs(kernel_np) * np.maximum(bk_np, 0)
-
-        layers_info.append({
-            'name': layer.name, 'layer': layer, 'shape': shape,
-            'in_dim': in_dim, 'out_dim': out_dim,
-            'conn_mul': conn_mul, 'scores_2d': scores,
-            'kernel_np': kernel_np, 'bk_np': bk_np,
-        })
-
-    if not layers_info:
-        raise ValueError("No HGQ layers with kq found.")
-
-    # ── 按层分配 EBOPS 预算 ───────────────────────────────────────────
-    if budget_weight == 'capacity':
-        caps = [info['in_dim'] * info['out_dim'] for info in layers_info]
-    else:
-        caps = [1.0] * len(layers_info)
-    total_cap = sum(caps)
-
-    ebops_per_conn = init_bk * b_a
-    floor_budget = min_per_layer * ebops_per_conn
-    total_floor  = floor_budget * len(layers_info)
-    if total_floor > target_ebops * 0.95:
-        min_per_layer = max(1, int(
-            target_ebops * 0.95 / (len(layers_info) * ebops_per_conn)))
-        floor_budget = min_per_layer * ebops_per_conn
-        total_floor  = floor_budget * len(layers_info)
-
-    distributable = target_ebops - total_floor
-    budgets = [floor_budget + distributable * (c / total_cap) for c in caps]
-
-    # ── 逐层选择 top-N 连接 ───────────────────────────────────────────
-    per_layer_bk_map = {}
-    actual_total = 0.0
-
-    if verbose:
-        print(f"\n[StructuredPrune] target_ebops={target_ebops:.1f}, "
-              f"init_bk={init_bk}, b_a={b_a}")
-        print(f"  {'layer':12s}  {'budget':>8s}  "
-              f"{'n_total':>7s}  {'n_surv':>6s}  {'pct':>5s}  "
-              f"{'mean_bk':>8s}  {'E_est':>8s}")
-
-    for info, budget_l in zip(layers_info, budgets):
-        layer  = info['layer']
-        shape  = info['shape']
-        scores = info['scores_2d']
-        cm     = info['conn_mul']
-        in_dim, out_dim = info['in_dim'], info['out_dim']
-
-        # 预算内存活数
-        n_max = max(min_per_layer, int(budget_l / (ebops_per_conn * cm)))
-
-        # 按重要性选 top-N
-        flat_sc = scores.ravel()
-        n_total = len(flat_sc)
-        n_survive = min(n_max, int((flat_sc > 1e-12).sum()))
-        n_survive = max(min_per_layer, n_survive)
-
-        top_idx = np.argsort(-flat_sc)[:n_survive]
-        surv_mask_flat = np.zeros(n_total, dtype=np.float32)
-        surv_mask_flat[top_idx] = 1.0
-        surv_mask_2d = surv_mask_flat.reshape(in_dim, out_dim)
-
-        # 构建 b_k map
-        if len(shape) == 2:
-            bk_map = surv_mask_2d * init_bk
-        else:
-            bk_map = np.broadcast_to(
-                (surv_mask_2d * init_bk)[np.newaxis, np.newaxis], shape
-            ).copy().astype(np.float32)
-
-        ebops_est = float(n_survive * ebops_per_conn * cm)
-        actual_total += ebops_est
-        per_layer_bk_map[layer.name] = bk_map
-
-        if verbose:
-            pct = n_survive / n_total * 100
-            print(f"  {layer.name:12s}  {budget_l:8.1f}  "
-                  f"{n_total:7d}  {n_survive:6d}  {pct:4.1f}%  "
-                  f"{init_bk:8.3f}  {ebops_est:8.1f}")
-
-    if verbose:
-        print(f"  {'TOTAL':12s}  {target_ebops:8.1f}  {'':7s}  {'':6s}  {'':5s}  "
-              f"{'':8s}  {actual_total:8.1f}")
-        print(f"  ratio = {actual_total / target_ebops:.3f}\n")
-
-    return per_layer_bk_map
