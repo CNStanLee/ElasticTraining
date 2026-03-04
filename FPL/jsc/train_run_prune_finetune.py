@@ -11,6 +11,7 @@ import numpy as np
 import tensorflow as tf
 
 from data.data import get_data
+from hgq.layers import QLayerBase
 from hgq.utils.sugar import Dataset, FreeEBOPs, ParetoFront
 from keras.callbacks import LearningRateScheduler
 from utils.train_utils import cosine_decay_restarts_schedule, TrainingTraceToH5, BudgetAwareEarlyStopping
@@ -34,9 +35,9 @@ random.seed(42)
 
 # baseline epoch=2236 最高精度检查点（val_acc=0.770，ebops=23589）
 BASELINE_CKPT  = 'results/baseline/epoch=2236-val_acc=0.770-ebops=23589-val_loss=0.641.keras'
-BASELINE_EBOPS = 19899      # 从文件名读，作为剪枝前参考值
+BASELINE_EBOPS = 23589      # 从文件名读，作为剪枝前参考值
 
-TARGET_EBOPS = 3000
+TARGET_EBOPS = 1000
 
 # ── 剪枝方式 ──────────────────────────────────────────────────────────────────
 # 'uniform'     : 旧方案 HighBitPruner (均匀缩放，有精度损失)
@@ -70,7 +71,7 @@ PHASE1_BETA_MAX  = 2e-4      # 上限：防止过度压缩
 #   - EBOPs 超标时 → 自动增大 beta → 梯度自然压低位宽
 #   - EBOPs 低于目标时 → 自动减小 beta → 允许位宽回升
 #   - HGQ 梯度全程自由决定 per-layer 分配，不受均匀约束
-PHASE2_EPOCHS    = 30000     # 增加 epoch：给 HGQ 足够时间找到最优分配
+PHASE2_EPOCHS    = 10000     # 增加 epoch：给 HGQ 足够时间找到最优分配
 PHASE2_LR        = 5e-4
 PHASE2_LR_CYCLE  = 800
 PHASE2_LR_MMUL   = 0.95
@@ -140,6 +141,137 @@ def print_bk_stats(model, label=''):
               f'n_dead(<=0.1)={int((arr<=0.1).sum())}/{len(arr)}')
 
 
+def compute_model_ebops(model, sample_input) -> float:
+    """通过一次前向传播实测模型当前 EBOPs（不依赖 checkpoint 文件名）。
+
+    使用 training=True 与 FreeEBOPs callback 保持一致。
+    """
+    from keras import ops
+    model(sample_input, training=True)
+    total = 0
+    for layer in model._flatten_layers():
+        if isinstance(layer, QLayerBase) and layer.enable_ebops and layer._ebops is not None:
+            total += int(ops.convert_to_numpy(layer._ebops))
+    return float(total)
+
+
+def correct_pruning_ebops(
+    model,
+    actual_ebops: float,
+    target_ebops: float,
+    sample_input,
+    tolerance: float = 0.03,
+    max_iter: int = 20,
+    b_k_min: float = 0.01,
+    b_k_max: float = 8.0,
+) -> float:
+    """用二分搜索将剪枝后的 kq.b 调整到使 EBOPs 命中目标。
+
+    问题背景
+    --------
+    剪枝后所有 kq.b 可能被 b_k_min 钉平（典型值全部 = 0.3）。此时普通
+    比例迭代会陷入"scale 上→脱底→爆涨 / scale 下→重新钉底→骤降"的
+    死循环（无穷振荡）。
+
+    二分法策略
+    ----------
+    1. 快照保存剪枝后的 kq.b
+    2. 确定 scale 的上下界（低 → EBOPs < target，高 → EBOPs > target）
+    3. 每次 mid = (lo + hi) / 2，apply saved * mid，实测 EBOPs，收窄区间
+    4. 收敛后一次性写入
+    """
+    from keras import ops as kops
+
+    # ── 快照 ────────────────────────────────────────────────────────────────
+    snapshots = {}  # layer_name → (b_var, b_arr_snapshot)
+    for layer in _flatten_layers(model):
+        kq = getattr(layer, 'kq', None)
+        if kq is None:
+            continue
+        b_var = _get_kq_var(kq, 'b')
+        if b_var is None:
+            b_var = _get_kq_var(kq, 'f')
+        if b_var is None:
+            continue
+        snapshots[id(layer)] = (b_var, b_var.numpy().copy())
+
+    def apply_scale(s: float):
+        for b_var, b_snap in snapshots.values():
+            b_new = np.where(
+                b_snap > 0.1,
+                np.clip(b_snap * s, b_k_min, b_k_max),
+                0.0,
+            )
+            b_var.assign(b_new.astype(np.float32))
+
+    def measure_ebops(s: float) -> float:
+        apply_scale(s)
+        model(sample_input, training=True)
+        return float(sum(
+            int(kops.convert_to_numpy(l._ebops))
+            for l in model._flatten_layers()
+            if isinstance(l, QLayerBase) and l.enable_ebops and l._ebops is not None
+        ))
+
+    # ── 快速检查：当前是否已经满足 ─────────────────────────────────────────
+    if abs(actual_ebops - target_ebops) / max(target_ebops, 1.0) <= tolerance:
+        print(f'  [EBOPs correction] already within tolerance: '
+              f'actual={actual_ebops:.1f}  target={target_ebops:.1f}')
+        return actual_ebops
+
+    # ── 确定二分上下界 ────────────────────────────────────────────────────
+    # 从 scale=1.0（当前快照）开始寻找 lo/hi
+    e_at_1 = measure_ebops(1.0)
+    if e_at_1 < target_ebops:
+        # 需要增大 scale
+        lo, hi = 1.0, 1.0
+        hi_e = e_at_1
+        for _ in range(20):
+            hi *= 2.0
+            hi_e = measure_ebops(hi)
+            if hi_e >= target_ebops:
+                break
+        lo_e = e_at_1
+    else:
+        # 需要减小 scale
+        lo, hi = 1.0, 1.0
+        lo_e = e_at_1
+        for _ in range(20):
+            lo /= 2.0
+            lo_e = measure_ebops(lo)
+            if lo_e <= target_ebops:
+                break
+        hi_e = e_at_1
+
+    print(f'  [EBOPs correction] bisect range: '
+          f'scale=[{lo:.4f},{hi:.4f}]  ebops=[{lo_e:.0f},{hi_e:.0f}]  target={target_ebops:.0f}')
+
+    # ── 二分搜索 ───────────────────────────────────────────────────────────
+    best_s, best_e = lo, lo_e
+    for i in range(max_iter):
+        mid = (lo + hi) / 2.0
+        mid_e = measure_ebops(mid)
+        err = abs(mid_e - target_ebops) / target_ebops
+        print(f'  [EBOPs correction] iter {i+1:2d}: '
+              f'scale={mid:.5f}  ebops={mid_e:.1f}  err={err*100:.1f}%')
+        if err < abs(best_e - target_ebops) / target_ebops:
+            best_s, best_e = mid, mid_e
+        if err <= tolerance:
+            break
+        if mid_e < target_ebops:
+            lo = mid
+        else:
+            hi = mid
+
+    # ── 写入最优 scale ─────────────────────────────────────────────────────
+    apply_scale(best_s)
+    final_e = measure_ebops(best_s)
+    print(f'  [EBOPs correction] final: scale={best_s:.5f}  '
+          f'ebops={final_e:.1f}  target={target_ebops:.1f}  '
+          f'err={abs(final_e-target_ebops)/target_ebops*100:.1f}%')
+    return final_e
+
+
 def make_lr_scheduler(lr_init, cycle, mmul, offset=0):
     """构造 LearningRateScheduler，offset 用于 phase2（epoch 从 PHASE1_EPOCHS 开始）。"""
     fn = cosine_decay_restarts_schedule(lr_init, cycle, t_mul=1.0, m_mul=mmul,
@@ -182,20 +314,38 @@ if __name__ == '__main__':
     dataset_train = Dataset(X_train, y_train, batch_size, device, shuffle=True)
     dataset_val   = Dataset(X_val,   y_val,   batch_size, device)
 
+    # 用于实测 EBOPs 的样本（训练模式，512 条与 FreeEBOPs 行为一致）
+    _sample_input = tf.constant(X_val[:512], dtype=tf.float32)
+
     # ── 2. 加载最优权重 ──────────────────────────────────────────────────────
     print(f'\n[2/5] Loading checkpoint: {BASELINE_CKPT}')
     model = keras.models.load_model(BASELINE_CKPT)
     model.summary()
     print_bk_stats(model, 'before pruning')
 
+    # 实测加载后的 EBOPs（不依赖文件名中的硬编码值）
+    actual_baseline_ebops = compute_model_ebops(model, _sample_input)
+    print(f'  Actual baseline EBOPs (measured): {actual_baseline_ebops:.1f}  '
+          f'(hardcoded ref: {BASELINE_EBOPS})')
+
     # ── 3. 一次性位宽剪枝 ────────────────────────────────────────────────────
-    print(f'\n[3/5] One-shot bit-width pruning ({PRUNE_METHOD}): {BASELINE_EBOPS} -> {TARGET_EBOPS}')
+    print(f'\n[3/5] One-shot bit-width pruning ({PRUNE_METHOD}): '
+          f'{actual_baseline_ebops:.1f} -> {TARGET_EBOPS}')
     if PRUNE_METHOD == 'sensitivity':
-        pruner = SensitivityAwarePruner(target_ebops=TARGET_EBOPS, pruned_threshold=0.1)
+        pruner = SensitivityAwarePruner(target_ebops=TARGET_EBOPS, pruned_threshold=0.1, b_k_min=0.3)
     else:
         pruner = HighBitPruner(target_ebops=TARGET_EBOPS, pruned_threshold=0.1)
-    pruner.prune_to_ebops(model, current_ebops=BASELINE_EBOPS, verbose=True)
+    pruner.prune_to_ebops(model, current_ebops=actual_baseline_ebops, verbose=True)
     print_bk_stats(model, 'after pruning')
+
+    # 实测剪枝后 EBOPs，迭代修正到目标 ±3%
+    post_prune_ebops = compute_model_ebops(model, _sample_input)
+    print(f'  Post-prune EBOPs (measured): {post_prune_ebops:.1f}  target: {TARGET_EBOPS}')
+    post_prune_ebops = correct_pruning_ebops(
+        model, post_prune_ebops, TARGET_EBOPS, _sample_input,
+        tolerance=0.03, max_iter=20,
+    )
+    print_bk_stats(model, 'after correction')
 
     # 剪枝后快速评估（预期精度有明显跌落，属正常现象）
     model.compile(
