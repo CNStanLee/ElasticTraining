@@ -43,7 +43,7 @@ METHODS = [
     ('gradual', 'Gradual training', '#1f77b4', 'o'),
     ('oneshot', 'One-shot baseline', '#d62728', 's'),
     ('oneshot_opt', 'One-shot optimized', '#2ca02c', '^'),
-    ('random_init', 'Random init (same mask)', '#ff7f0e', 'D'),
+    ('random_init', 'Random init (no shared mask)', '#ff7f0e', 'D'),
 ]
 
 if str(JSC_ROOT) not in sys.path:
@@ -52,6 +52,7 @@ if str(JSC_ROOT) not in sys.path:
 from data.data import get_data
 from hgq.layers import QLayerBase, QEinsumDenseBatchnorm  # noqa: F401
 from utils.ramanujan_budget_utils import _flatten_layers, _get_kq_var
+from run_one_shot_prune_only import bisect_ebops_to_target
 
 
 def parse_gradual_checkpoints():
@@ -170,7 +171,9 @@ def _grad_stats(model, x_grad, y_grad):
     kernel_grad_norms = []
     per_layer = {}
 
+    grad_by_vid = {}
     for v, g in zip(model.trainable_variables, grads):
+        grad_by_vid[id(v)] = g
         if g is None:
             continue
         g_np = np.array(g.numpy(), dtype=np.float32)
@@ -178,13 +181,25 @@ def _grad_stats(model, x_grad, y_grad):
         g_total += g_np.size
         g_near_zero += int(np.sum(np.abs(g_np) < 1e-8))
 
-        vname = v.name
-        lname = vname.split('/')[0]
-        per_layer.setdefault(lname, 0.0)
-        per_layer[lname] += float(np.linalg.norm(g_np))
+        # Keras3 variable names can be generic ("kernel", "bias"), so
+        # layer-wise aggregation is done via object identity below.
 
-        if 'kernel' in vname:
+        if 'kernel' in v.name:
             kernel_grad_norms.append(float(np.linalg.norm(g_np)))
+
+    # Aggregate gradients by actual layer objects to avoid name collisions.
+    for layer in _flatten_layers(model):
+        lsum = 0.0
+        has_any = False
+        for v in getattr(layer, 'trainable_variables', []):
+            g = grad_by_vid.get(id(v), None)
+            if g is None:
+                continue
+            g_np = np.array(g.numpy(), dtype=np.float32)
+            lsum += float(np.linalg.norm(g_np))
+            has_any = True
+        if has_any:
+            per_layer[layer.name] = lsum
 
     return {
         'loss': float(to_float(loss)),
@@ -318,23 +333,179 @@ def analyse_model(model, x_eval, y_eval, x_grad, y_grad):
     return rec
 
 
-def reinit_active_kernels(model, seed=0):
+def reinit_all_kernels(model, seed=0):
     rng = np.random.default_rng(seed)
     for layer in _flatten_layers(model):
-        if not hasattr(layer, 'kernel') or getattr(layer, 'kq', None) is None:
+        if not hasattr(layer, 'kernel'):
             continue
         ker = np.array(layer.kernel.numpy(), dtype=np.float32)
-        bits = _bits_np(layer.kq, layer.kernel)
-        if bits is None:
-            continue
-        active = bits > 1e-6
         fan_in = int(np.prod(ker.shape[:-1])) if ker.ndim >= 2 else int(ker.size)
         std = float(math.sqrt(2.0 / max(fan_in, 1)))
         rand = rng.normal(loc=0.0, scale=std, size=ker.shape).astype(np.float32)
-        ker_new = np.where(active, rand, 0.0).astype(np.float32)
-        layer.kernel.assign(ker_new)
+        layer.kernel.assign(rand)
         if hasattr(layer, 'bias') and layer.bias is not None:
             layer.bias.assign(np.zeros_like(layer.bias.numpy(), dtype=np.float32))
+
+
+def calibrate_model_ebops_to_target(model, target_ebops, sample_input):
+    """Calibrate model EBOPs to target after random init."""
+    return bisect_ebops_to_target(
+        model,
+        target_ebops=float(target_ebops),
+        sample_input=sample_input,
+        tolerance=0.02,
+        max_iter=30,
+        b_k_min=0.01,
+        b_k_max=8.0,
+        allow_connection_kill=True,
+    )
+
+
+def _randmask_snapshots(model, seed=0, b_floor=0.35, b_ceiling=6.0):
+    rng = np.random.default_rng(seed)
+    snaps = []
+    for layer in _flatten_layers(model):
+        if not hasattr(layer, 'kernel') or getattr(layer, 'kq', None) is None:
+            continue
+
+        bits = _bits_np(layer.kq, layer.kernel)
+        if bits is None:
+            continue
+        active0 = bits > 1e-6
+        if not np.any(active0):
+            continue
+
+        kq = layer.kq
+        b_var = _get_kq_var(kq, 'b')
+        if b_var is None:
+            b_var = _get_kq_var(kq, 'f')
+        i_var = _get_kq_var(kq, 'i')
+        k_var = _get_kq_var(kq, 'k')
+        if b_var is None:
+            continue
+
+        kernel0 = np.array(layer.kernel.numpy(), dtype=np.float32)
+        b0 = np.array(b_var.numpy(), dtype=np.float32)
+        i0 = np.array(i_var.numpy(), dtype=np.float32) if i_var is not None else None
+        k0 = np.array(k_var.numpy(), dtype=np.float32) if k_var is not None else None
+
+        score = rng.random(size=active0.shape, dtype=np.float32)
+        score = np.where(active0, score, 2.0).astype(np.float32)
+
+        bq = getattr(layer, 'bq', None)
+        bb_var = _get_kq_var(bq, 'b') if bq is not None else None
+        if bb_var is None and bq is not None:
+            bb_var = _get_kq_var(bq, 'f')
+        bi_var = _get_kq_var(bq, 'i') if bq is not None else None
+        bk_var = _get_kq_var(bq, 'k') if bq is not None else None
+        bb0 = np.array(bb_var.numpy(), dtype=np.float32) if bb_var is not None else None
+        bi0 = np.array(bi_var.numpy(), dtype=np.float32) if bi_var is not None else None
+        bk0 = np.array(bk_var.numpy(), dtype=np.float32) if bk_var is not None else None
+
+        snaps.append({
+            'layer': layer,
+            'active0': active0,
+            'kernel0': kernel0,
+            'score': score,
+            'b_var': b_var,
+            'b0': b0,
+            'i_var': i_var,
+            'i0': i0,
+            'k_var': k_var,
+            'k0': k0,
+            'bb_var': bb_var,
+            'bb0': bb0,
+            'bi_var': bi_var,
+            'bi0': bi0,
+            'bk_var': bk_var,
+            'bk0': bk0,
+            'b_floor': float(b_floor),
+            'b_ceiling': float(b_ceiling),
+        })
+    return snaps
+
+
+def _apply_randmask_ratio(snaps, keep_ratio):
+    r = float(np.clip(keep_ratio, 0.0, 1.0))
+    for s in snaps:
+        active0 = s['active0']
+        n_active = int(np.sum(active0))
+        n_keep = int(np.clip(round(n_active * r), 1, n_active))
+
+        score_act = s['score'][active0]
+        kth = np.partition(score_act, n_keep - 1)[n_keep - 1]
+        keep = active0 & (s['score'] <= kth)
+
+        kernel_new = np.where(keep, s['kernel0'], 0.0).astype(np.float32)
+        s['layer'].kernel.assign(kernel_new)
+
+        b_new = np.where(
+            keep,
+            np.clip(np.maximum(s['b0'], s['b_floor']), s['b_floor'], s['b_ceiling']),
+            0.0,
+        ).astype(np.float32)
+        s['b_var'].assign(b_new)
+
+        if s['i_var'] is not None and s['i0'] is not None:
+            s['i_var'].assign(np.where(keep, np.clip(s['i0'], -2.0, 6.0), -16.0).astype(np.float32))
+        if s['k_var'] is not None:
+            if s['k0'] is not None:
+                s['k_var'].assign(np.where(keep, s['k0'], 0.0).astype(np.float32))
+            else:
+                s['k_var'].assign(np.where(keep, 1.0, 0.0).astype(np.float32))
+
+        cols_keep = np.sum(keep, axis=0) > 0
+        if s['bb_var'] is not None and s['bb0'] is not None:
+            bb_new = np.where(
+                cols_keep,
+                np.clip(np.maximum(s['bb0'], s['b_floor']), s['b_floor'], s['b_ceiling']),
+                0.0,
+            ).astype(np.float32)
+            s['bb_var'].assign(bb_new)
+        if s['bi_var'] is not None and s['bi0'] is not None:
+            s['bi_var'].assign(np.where(cols_keep, np.clip(s['bi0'], -2.0, 6.0), -16.0).astype(np.float32))
+        if s['bk_var'] is not None:
+            if s['bk0'] is not None:
+                s['bk_var'].assign(np.where(cols_keep, s['bk0'], 0.0).astype(np.float32))
+            else:
+                s['bk_var'].assign(np.where(cols_keep, 1.0, 0.0).astype(np.float32))
+
+
+def randomize_mask_and_calibrate_to_target(model, target_ebops, sample_input, seed=0):
+    """Random new mask (not shared with any method), then EBOPs calibration."""
+    snaps = _randmask_snapshots(model, seed=seed)
+    if not snaps:
+        return compute_model_ebops(model, sample_input)
+
+    lo, hi = 0.0, 1.0
+    best_r = 1.0
+    best_e = float('inf')
+    target = float(target_ebops)
+
+    for _ in range(20):
+        mid = 0.5 * (lo + hi)
+        _apply_randmask_ratio(snaps, mid)
+        eb = compute_model_ebops(model, sample_input)
+        if abs(eb - target) < abs(best_e - target):
+            best_e = eb
+            best_r = mid
+        if eb > target:
+            hi = mid
+        else:
+            lo = mid
+
+    _apply_randmask_ratio(snaps, best_r)
+    # Fine tune bits only; keep random mask fixed
+    return bisect_ebops_to_target(
+        model,
+        target_ebops=target,
+        sample_input=sample_input,
+        tolerance=0.02,
+        max_iter=30,
+        b_k_min=0.01,
+        b_k_max=8.0,
+        allow_connection_kill=False,
+    )
 
 
 def trainability_200(
@@ -390,7 +561,7 @@ def trainability_200(
 
 def collect_state(model, x_grad, y_grad):
     layer_names = []
-    masks = []
+    bitmaps = []
     bits_mean = []
     dead_ratio = []
     b_mean = []
@@ -403,10 +574,11 @@ def collect_state(model, x_grad, y_grad):
             continue
 
         active = bits > 1e-6
-        _, m2 = _flatten_kernel_and_mask(np.array(layer.kernel.numpy(), dtype=np.float32), active.astype(np.float32))
+        k2, _ = _flatten_kernel_and_mask(np.array(layer.kernel.numpy(), dtype=np.float32), active.astype(np.float32))
+        bits2, _ = _flatten_kernel_and_mask(k2, bits.astype(np.float32))
 
         layer_names.append(layer.name)
-        masks.append(m2)
+        bitmaps.append(bits2)
         bits_mean.append(float(np.mean(bits)))
         dead_ratio.append(float(np.mean(~active)))
 
@@ -420,7 +592,7 @@ def collect_state(model, x_grad, y_grad):
 
     return {
         'layer_names': layer_names,
-        'masks': masks,
+        'bitmaps': bitmaps,
         'bits_mean': bits_mean,
         'dead_ratio': dead_ratio,
         'b_mean': b_mean,
@@ -478,6 +650,23 @@ def plot_state_connectivity(target, states_by_method, out_path):
     if not methods_present:
         return
     layer_names = states_by_method[methods_present[0][0]]['layer_names']
+    # Contrast stretch: use percentile of positive bits to avoid low-contrast plots.
+    all_pos = []
+    for mkey, _, _, _ in methods_present:
+        st = states_by_method[mkey]
+        for bm in st.get('bitmaps', []):
+            if bm is None:
+                continue
+            pos = bm[np.isfinite(bm) & (bm > 0)]
+            if pos.size:
+                all_pos.append(pos)
+    if all_pos:
+        all_pos = np.concatenate(all_pos)
+        vmax = float(np.percentile(all_pos, 95))
+    else:
+        vmax = 1.0
+    vmax = max(vmax, 1e-6)
+
     nrows = len(methods_present)
     ncols = len(layer_names)
     fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 2.6 * nrows), squeeze=False)
@@ -486,16 +675,23 @@ def plot_state_connectivity(target, states_by_method, out_path):
         st = states_by_method[mkey]
         for c, lname in enumerate(layer_names):
             ax = axes[r, c]
-            m = st['masks'][c]
-            ax.imshow(m, aspect='auto', cmap='viridis', vmin=0.0, vmax=1.0)
+            bm = st['bitmaps'][c]
+            # white background (0), darker color for larger bitwidth
+            disp = np.clip(np.array(bm, dtype=np.float32), 0.0, vmax) / vmax
+            disp = np.power(disp, 0.6, dtype=np.float32)  # lift contrast in low-mid range
+            ax.imshow(disp, aspect='auto', cmap='Greys', vmin=0.0, vmax=1.0)
+            ax.set_facecolor('white')
             if r == 0:
                 ax.set_title(lname)
             if c == 0:
                 ax.set_ylabel(mlabel)
+            for spine in ax.spines.values():
+                spine.set_edgecolor('black')
+                spine.set_linewidth(1.2)
             ax.set_xticks([])
             ax.set_yticks([])
 
-    fig.suptitle(f'Connectivity Masks by Layer (target={target})')
+    fig.suptitle(f'Connectivity/Bitwidth Maps by Layer (target={target})')
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
@@ -600,7 +796,7 @@ def main():
     parser.add_argument('--train200_epochs', type=int, default=200)
     parser.add_argument('--train200_train_samples', type=int, default=4096)
     parser.add_argument('--train200_val_samples', type=int, default=2048)
-    parser.add_argument('--train200_batch_size', type=int, default=4096)
+    parser.add_argument('--train200_batch_size', type=int, default=33200)
     parser.add_argument('--train200_lr', type=float, default=3e-4)
     args = parser.parse_args()
 
@@ -678,14 +874,14 @@ def main():
             model_map['oneshot_opt'] = mp
             pair_row['oneshot_opt_file'] = p['name']
             pair_row.update({f'oneshot_opt_{k}': v for k, v in pm.items()})
-            # random-init baseline on the same quantization/mask topology as oneshot_opt
+            # random-init baseline: do not reuse oneshot_opt mask/topology
             mr = keras.models.load_model(BASELINE_CKPT, compile=False)
-            mr.load_weights(p['path'])
-            reinit_active_kernels(mr, seed=2000 + int(target))
+            reinit_all_kernels(mr, seed=2000 + int(target))
+            randomize_mask_and_calibrate_to_target(mr, target, x_eval[:512], seed=6000 + int(target))
             rm = analyse_model(mr, x_eval, y_eval, x_grad, y_grad)
             mr_train = keras.models.load_model(BASELINE_CKPT, compile=False)
-            mr_train.load_weights(p['path'])
-            reinit_active_kernels(mr_train, seed=2000 + int(target))
+            reinit_all_kernels(mr_train, seed=2000 + int(target))
+            randomize_mask_and_calibrate_to_target(mr_train, target, x_eval[:512], seed=6000 + int(target))
             rm.update(
                 trainability_200(
                     mr_train,
@@ -699,9 +895,9 @@ def main():
                     seed=3000 + int(target),
                 )
             )
-            records.append({'kind': 'random_init', 'target_ebops': target, 'source_file': f'random-init-from-{p["name"]}', **rm})
+            records.append({'kind': 'random_init', 'target_ebops': target, 'source_file': f'random-init-baseline-target{target}', **rm})
             model_map['random_init'] = mr
-            pair_row['random_init_file'] = f'random-init-from-{p["name"]}'
+            pair_row['random_init_file'] = f'random-init-baseline-target{target}'
             pair_row.update({f'random_init_{k}': v for k, v in rm.items()})
 
         if o is not None:

@@ -523,10 +523,12 @@ def spectral_quant_prune_to_ebops(
     low_budget_threshold: float = 900.0,
     min_hidden_width: int = 4,
     near_budget_ratio: float = 1.6,
+    high_budget_ratio: float = 0.45,
     verbose: bool = True,
 ):
     """谱/拓扑友好的一次性剪枝：低预算走结构化链路，其余走列 top-k。"""
     current_ebops = compute_model_ebops(model, sample_input)
+    budget_ratio = float(target_ebops) / max(float(current_ebops), 1.0)
     if current_ebops <= float(target_ebops) * float(near_budget_ratio):
         if verbose:
             print(
@@ -535,6 +537,22 @@ def spectral_quant_prune_to_ebops(
                 f"ratio={current_ebops / max(target_ebops, 1.0):.3f}"
             )
         return current_ebops, False
+
+    # 高预算场景只需要温和压缩，避免 top-k 重布线带来不必要的表示退化
+    if budget_ratio >= float(high_budget_ratio):
+        if verbose:
+            print(
+                f"[SpectralQuantPruner] high-budget fallback to sensitivity: "
+                f"target/current={budget_ratio:.3f} >= {high_budget_ratio:.3f}"
+            )
+        pruner = SensitivityAwarePruner(
+            target_ebops=float(target_ebops),
+            pruned_threshold=0.1,
+            b_k_min=max(float(b_floor), 0.20),
+        )
+        pruner.prune_to_ebops(model, current_ebops=current_ebops, verbose=verbose)
+        measured = compute_model_ebops(model, sample_input)
+        return measured, False
 
     if low_budget_structured and float(target_ebops) <= float(low_budget_threshold):
         measured = structured_chain_prune_to_ebops(
@@ -991,6 +1009,8 @@ def main():
                         help='Minimum hidden width kept by structured low-budget pruning')
     parser.add_argument('--near_budget_ratio', type=float, default=1.6,
                         help='Skip structural pruning when current_ebops <= target_ebops * ratio')
+    parser.add_argument('--high_budget_ratio', type=float, default=0.45,
+                        help='Use sensitivity fallback in spectral_quant when target/current >= this ratio')
     parser.add_argument('--low_budget_structured', action='store_true', default=True,
                         help='Enable structured low-budget pruning branch (default: enabled)')
     parser.add_argument('--no_low_budget_structured', action='store_true',
@@ -1014,6 +1034,7 @@ def main():
         print(f'  low_budget_structured: {args.low_budget_structured}')
         print(f'  low_budget_threshold : {args.low_budget_threshold}')
         print(f'  near_budget_ratio    : {args.near_budget_ratio}')
+        print(f'  high_budget_ratio    : {args.high_budget_ratio}')
     print('=' * 70)
 
     teacher_model = keras.models.load_model(args.checkpoint, compile=False)
@@ -1045,6 +1066,7 @@ def main():
             low_budget_threshold=args.low_budget_threshold,
             min_hidden_width=args.min_hidden_width,
             near_budget_ratio=args.near_budget_ratio,
+            high_budget_ratio=args.high_budget_ratio,
             verbose=True,
         )
 
@@ -1112,6 +1134,7 @@ def main():
         'low_budget_threshold': float(args.low_budget_threshold),
         'min_hidden_width': int(args.min_hidden_width),
         'near_budget_ratio': float(args.near_budget_ratio),
+        'high_budget_ratio': float(args.high_budget_ratio),
         'used_structured_low_budget': bool(used_structured_low_budget),
         'sample_input': sample_src,
         'baseline_ebops_measured': float(baseline_ebops),
