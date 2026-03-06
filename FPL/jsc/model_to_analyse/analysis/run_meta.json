@@ -1,0 +1,26 @@
+{
+  "n_gradual": 15,
+  "n_oneshot": 20,
+  "n_oneshot_opt": 15,
+  "n_random_init": 15,
+  "n_pairs": 15,
+  "baseline_ckpt": "/home/changhong/prj/ElasticTraining/FPL/jsc/model_to_analyse/gradual_training/epoch=7789-val_acc=0.770-ebops=19899-val_loss=0.641.keras",
+  "eval_samples": 4096,
+  "grad_samples": 2048,
+  "train200_epochs": 200,
+  "train200_train_samples": 1024,
+  "train200_val_samples": 512,
+  "train200_batch_size": 1024,
+  "train200_lr": 0.0003,
+  "state_targets": [
+    300,
+    2005,
+    5011
+  ],
+  "n_records_by_kind": {
+    "gradual": 15,
+    "oneshot": 15,
+    "oneshot_opt": 15,
+    "random_init": 15
+  }
+}

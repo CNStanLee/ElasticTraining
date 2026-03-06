@@ -1,0 +1,16 @@
+{
+  "checkpoint": "model_to_analyse/gradual_training/epoch=142414-val_acc=0.743-ebops=702-val_loss=0.762.keras",
+  "target_ebops": 500.0,
+  "prune_method": "spectral_quant",
+  "min_degree": 2,
+  "b_floor": 0.35,
+  "low_budget_structured": true,
+  "low_budget_threshold": 900.0,
+  "min_hidden_width": 4,
+  "used_structured_low_budget": true,
+  "sample_input": "dataset:data/dataset.h5",
+  "baseline_ebops_measured": 704.0,
+  "post_prune_ebops_measured": 620.0,
+  "calibrated": true,
+  "weights_path": "model_to_analyse/oneshot_opt_from702/epoch=142414-val_acc=0.743-ebops=702-val_loss=0.762-oneshot-spectral_quant-target500-ebops620.weights.h5"
+}

@@ -80,10 +80,14 @@ random.seed(42)
 # 配置
 # ═══════════════════════════════════════════════════════════════════════════════
 
-BASELINE_CKPT = "results/baseline/epoch=2236-val_acc=0.770-ebops=23589-val_loss=0.641.keras"
-BASELINE_EBOPS = 23589
+# BASELINE_CKPT = "results/baseline/epoch=2236-val_acc=0.770-ebops=23589-val_loss=0.641.keras"
+# BASELINE_EBOPS = 23589
+# epoch=3699-val_acc=0.770-ebops=23293-val_loss=0.640.keras
 
-TARGET_EBOPS = 400  # 最终目标（可通过命令行覆盖）
+BASELINE_CKPT = "results/baseline/epoch=3699-val_acc=0.770-ebops=23293-val_loss=0.640.keras"
+BASELINE_EBOPS = 23293
+
+TARGET_EBOPS = 500  # 最终目标（可通过命令行覆盖）
 
 # ── 输入 ─────────────────────────────────────────────────────────────────────
 input_folder = "data/dataset.h5"
@@ -91,7 +95,7 @@ batch_size = 33200
 
 # ── 渐进式预算 ────────────────────────────────────────────────────────────────
 # 不用一次性剪枝冲击，而是从 warmup_ebops 指数衰减到 TARGET_EBOPS
-WARMUP_EBOPS = 2000  # 起始目标（约 baseline 的 1/10，留足学习空间）
+WARMUP_EBOPS = 3000  # 起始目标（约 baseline 的 1/10，留足学习空间）
 BUDGET_DECAY_EP = 3000  # 多少 epoch 内从 warmup 降到 final
 
 # ── Phase 1：恢复 + 渐进压缩 ──────────────────────────────────────────────────
@@ -160,11 +164,6 @@ parser.add_argument(
     action="store_true",
     help="Disable progressive budget (use one-shot prune)",
 )
-parser.add_argument(
-    "--no_beta_curriculum",
-    action="store_true",
-    help="Disable beta curriculum controller (no panic recovery restarts)",
-)
 args, _ = parser.parse_known_args()
 
 TARGET_EBOPS = args.target_ebops
@@ -179,7 +178,6 @@ USE_SPECTRAL_REG = not args.no_spectral_reg
 USE_REWIRING = not args.no_rewiring
 USE_ADAPTIVE_LR = not args.no_adaptive_lr
 USE_PROGRESSIVE = not args.no_progressive
-USE_BETA_CURRICULUM = not args.no_beta_curriculum
 
 output_folder = f"results/low_budget_{int(TARGET_EBOPS)}/"
 device = get_tf_device()
@@ -336,8 +334,7 @@ if __name__ == "__main__":
     )
     print(
         f"  Adaptive LR   : {USE_ADAPTIVE_LR}  |  "
-        f"Progressive budget: {USE_PROGRESSIVE}  |  "
-        f"Beta curriculum: {USE_BETA_CURRICULUM}"
+        f"Progressive budget: {USE_PROGRESSIVE}"
     )
     print(f"  Phase1: {PHASE1_EPOCHS} ep  |  Phase2: {PHASE2_EPOCHS} ep")
     print(f"  Output: {output_folder}")
@@ -466,16 +463,15 @@ if __name__ == "__main__":
         )
         p1_callbacks.append(spec_reg)
 
-    if USE_BETA_CURRICULUM:
-        p1_curriculum = BetaCurriculumController(
-            budget_ctrl=p1_budget_ctrl,
-            stall_patience=STALL_PATIENCE,
-            recover_epochs=RECOVER_EPOCHS,
-            min_delta=5e-5,
-            restart_decay=RESTART_DECAY,
-            max_restarts=MAX_RESTARTS,
-        )
-        p1_callbacks.append(p1_curriculum)
+    p1_curriculum = BetaCurriculumController(
+        budget_ctrl=p1_budget_ctrl,
+        stall_patience=STALL_PATIENCE,
+        recover_epochs=RECOVER_EPOCHS,
+        min_delta=5e-5,
+        restart_decay=RESTART_DECAY,
+        max_restarts=MAX_RESTARTS,
+    )
+    p1_callbacks.append(p1_curriculum)
 
     if USE_ADAPTIVE_LR:
         p1_lr_scaler = AdaptiveLRBiwidthScaler(
@@ -550,16 +546,15 @@ if __name__ == "__main__":
             )
         )
 
-    if USE_BETA_CURRICULUM:
-        p2_curriculum = BetaCurriculumController(
-            budget_ctrl=p2_budget_ctrl,
-            stall_patience=STALL_PATIENCE * 2,
-            recover_epochs=RECOVER_EPOCHS,
-            min_delta=2e-5,
-            restart_decay=RESTART_DECAY,
-            max_restarts=MAX_RESTARTS,
-        )
-        p2_callbacks.append(p2_curriculum)
+    p2_curriculum = BetaCurriculumController(
+        budget_ctrl=p2_budget_ctrl,
+        stall_patience=STALL_PATIENCE * 2,
+        recover_epochs=RECOVER_EPOCHS,
+        min_delta=2e-5,
+        restart_decay=RESTART_DECAY,
+        max_restarts=MAX_RESTARTS,
+    )
+    p2_callbacks.append(p2_curriculum)
 
     if USE_ADAPTIVE_LR:
         p2_callbacks.append(
