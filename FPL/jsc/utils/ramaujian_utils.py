@@ -188,6 +188,7 @@ class RamanujanMaskEnforcer(keras.callbacks.Callback):
         enforce_int_bits: float = 0.0,
         release_epoch: int | None = None,
         fade_epochs: int = 0,
+        min_active_frac_bits: float | None = None,
     ):
         super().__init__()
         self.layer_names = set(layer_names) if layer_names is not None else None
@@ -195,6 +196,7 @@ class RamanujanMaskEnforcer(keras.callbacks.Callback):
         self.enforce_int_bits = enforce_int_bits
         self.release_epoch = release_epoch
         self.fade_epochs = max(fade_epochs, 1)
+        self.min_active_frac_bits = min_active_frac_bits
         self._current_epoch = 0
 
     def on_epoch_begin(self, epoch, logs=None):
@@ -237,6 +239,15 @@ class RamanujanMaskEnforcer(keras.callbacks.Callback):
                     # 线性插值：渐进放开
                     target = np.where(pruned > 0, self.enforce_frac_bits, b_arr)
                     b_arr = strength * target + (1.0 - strength) * b_arr
+                # 活跃连接 b_k 下限保护：随 enforce_strength 线性衰减
+                if self.min_active_frac_bits is not None and strength > 0.0:
+                    effective_floor = self.min_active_frac_bits * strength
+                    active = mask.numpy() > 0
+                    b_arr = np.where(
+                        active & (b_arr < effective_floor),
+                        effective_floor,
+                        b_arr,
+                    )
                 b_var.assign(b_arr)
 
             i_var = _get_kq_var(kq, "i")

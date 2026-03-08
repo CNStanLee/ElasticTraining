@@ -47,7 +47,7 @@ random.seed(42)
 BASELINE_CKPT = "results/baseline/epoch=7789-val_acc=0.770-ebops=19899-val_loss=0.641.keras"
 BASELINE_EBOPS = 19899
 
-TARGET_EBOPS = 8504
+TARGET_EBOPS = 1000
 
 # ── 剪枝方式 ──────────────────────────────────────────────────────────────────
 # 'uniform'        : 旧方案 HighBitPruner (均匀缩放，有精度损失)
@@ -69,15 +69,9 @@ PHASE1_EPOCHS    = 5000
 PHASE1_LR        = 2e-3      # 高 LR：加快重适应
 PHASE1_LR_CYCLE  = 2000
 PHASE1_LR_MMUL   = 0.9
-PHASE1_BETA_INIT = 5e-7      # 极低起始 beta：避免剪枝后微小 kq.b 被beta梯度一步压死
+PHASE1_BETA_INIT = 3e-5      # controller 起始值
 PHASE1_BETA_MIN  = 1e-8      # 近零下限：EBOPs 低于目标时几乎不压缩
 PHASE1_BETA_MAX  = 2e-4      # 上限：防止过度压缩
-
-# ── 校准补偿 ─────────────────────────────────────────────────────────────────
-# compute_model_ebops（单次前向传播）测到的 EBOPs 比训练中 FreeEBOPs 高 ~7-10%
-# （训练中 optimizer 会在 forward 后更新 kq.b，_ebops 反映的是 post-gradient 状态）
-# 因此剪枝校准时多留 10% 余量，让训练初期 FreeEBOPs ≈ TARGET 而非偏低
-CALIBRATION_OVERSHOOT = 1.10
 
 # ── Phase 2：精度最大化 ──────────────────────────────────────────────────────
 # 核心改进：完全取消均匀投影器。
@@ -123,8 +117,6 @@ parser.add_argument('--no_functional_calibrate', action='store_true',
                     help='Disable teacher-guided functional calibration')
 parser.add_argument('--functional_passes', type=int, default=2,
                     help='Number of teacher-guided calibration passes after pruning')
-parser.add_argument('--calib_overshoot', type=float, default=CALIBRATION_OVERSHOOT,
-                    help='Over-calibrate pruning to target*overshoot to compensate calibration→training gap')
 args, _ = parser.parse_known_args()
 
 TARGET_EBOPS    = args.target_ebops
@@ -132,7 +124,6 @@ PHASE1_EPOCHS   = args.phase1_epochs
 PHASE2_EPOCHS   = args.phase2_epochs
 BASELINE_CKPT   = args.checkpoint
 PRUNE_METHOD    = args.prune_method
-CALIBRATION_OVERSHOOT = args.calib_overshoot
 EARLYSTOP_BUDGET = TARGET_EBOPS * 1.5
 if args.no_auto_warm_start:
     args.auto_warm_start = False
@@ -417,9 +408,8 @@ if __name__ == '__main__':
     dataset_train = Dataset(X_train, y_train, batch_size, device, shuffle=True)
     dataset_val   = Dataset(X_val,   y_val,   batch_size, device)
 
-    # 用于实测 EBOPs 的样本
-    # 使用训练数据（而非验证数据），与 FreeEBOPs 在训练 epoch 中看到的数据分布一致
-    _sample_input = tf.constant(X_train[:min(2048, len(X_train))], dtype=tf.float32)
+    # 用于实测 EBOPs 的样本（训练模式，512 条与 FreeEBOPs 行为一致）
+    _sample_input = tf.constant(X_val[:512], dtype=tf.float32)
 
     # ── 2. 加载最优权重 ──────────────────────────────────────────────────────
     print(f'\n[2/5] Loading checkpoint: {BASELINE_CKPT}')
@@ -478,14 +468,10 @@ if __name__ == '__main__':
         )
         print(f'  Post-functional-calib EBOPs (measured): {post_func_ebops:.1f}')
 
-    # 校准目标 = TARGET_EBOPS * CALIBRATION_OVERSHOOT
-    # 多留 10% 余量，让训练中 FreeEBOPs（post-gradient 测量）≈ TARGET_EBOPS
-    calib_target = TARGET_EBOPS * CALIBRATION_OVERSHOOT
-    print(f'  Calibrating to {calib_target:.1f} (target={TARGET_EBOPS:.1f} × overshoot={CALIBRATION_OVERSHOOT})')
     if PRUNE_METHOD == 'spectral_quant':
         post_prune_ebops = bisect_ebops_to_target(
             model,
-            target_ebops=calib_target,
+            target_ebops=TARGET_EBOPS,
             sample_input=_sample_input,
             tolerance=0.03,
             max_iter=24,
@@ -494,7 +480,7 @@ if __name__ == '__main__':
         )
     else:
         post_prune_ebops = correct_pruning_ebops(
-            model, post_prune_ebops, calib_target, _sample_input,
+            model, post_prune_ebops, TARGET_EBOPS, _sample_input,
             tolerance=0.03, max_iter=20,
         )
     print_bk_stats(model, 'after correction')
@@ -508,28 +494,6 @@ if __name__ == '__main__':
     )
     res = model.evaluate(dataset_val, verbose=0)
     print(f'  Post-pruning  val_loss={res[0]:.4f}  val_accuracy={res[1]:.4f}')
-
-    # ── 编译后 EBOPs 再验证 ──────────────────────────────────────────────────
-    # model.compile + evaluate 可能触发内部状态变化，重新测量确认
-    post_compile_ebops = compute_model_ebops(model, _sample_input)
-    if abs(post_compile_ebops - calib_target) / max(calib_target, 1.0) > 0.05:
-        print(f'  [WARN] Post-compile EBOPs drifted: {post_compile_ebops:.1f} vs calib_target {calib_target:.1f}')
-        print(f'  Re-running binary search correction...')
-        if PRUNE_METHOD == 'spectral_quant':
-            post_compile_ebops = bisect_ebops_to_target(
-                model, target_ebops=calib_target, sample_input=_sample_input,
-                tolerance=0.03, max_iter=24,
-                b_k_min=0.20 if near_budget_preserve_case else 0.35,
-                allow_connection_kill=(not used_structured_low_budget) and (not near_budget_preserve_case),
-            )
-        else:
-            post_compile_ebops = correct_pruning_ebops(
-                model, post_compile_ebops, calib_target, _sample_input,
-                tolerance=0.03, max_iter=20,
-            )
-        print(f'  Re-corrected EBOPs: {post_compile_ebops:.1f}')
-    else:
-        print(f'  Post-compile EBOPs verified: {post_compile_ebops:.1f}  (OK, calib_target={calib_target:.1f})')
 
     # ── 共享 Callbacks（两个 phase 都用） ─────────────────────────────────────
     ebops_cb  = FreeEBOPs()
@@ -604,16 +568,13 @@ if __name__ == '__main__':
     else:
         set_all_beta(model, PHASE1_BETA_INIT)
         phase1_budget_ctrl = BetaOnlyBudgetController(
-            target_ebops    = TARGET_EBOPS,
-            margin          = 0.20,          # ±20% 容忍带：剪枝后波动剧烈，宽带避免过激
-            beta_init       = PHASE1_BETA_INIT,
-            beta_min        = PHASE1_BETA_MIN,
-            beta_max        = PHASE1_BETA_MAX,
-            adjust_factor   = 1.15,          # 温和调整（避免 beta 跳变导致 kq.b 崩溃）
-            ema_alpha       = 0.25,           # 较快 EMA（兼顾平滑 + rescue 响应速度）
-            warmup_epochs   = 100,           # 前 100 epoch 调整力度逐渐增加
-            max_change_ratio = 1.5,          # 每 epoch beta 最多变化 1.5 倍
-            init_ebops      = TARGET_EBOPS,  # EMA 从目标值开始，避免首轮过激反应
+            target_ebops  = TARGET_EBOPS,
+            margin        = 0.15,          # ±15% 容忍带
+            beta_init     = PHASE1_BETA_INIT,
+            beta_min      = PHASE1_BETA_MIN,
+            beta_max      = PHASE1_BETA_MAX,
+            adjust_factor = 1.3,
+            ema_alpha     = 0.3,
         )
 
     phase1_callbacks = [
@@ -679,16 +640,13 @@ if __name__ == '__main__':
             phase2_ema = 0.20
             phase2_beta_max_use = min(PHASE2_BETA_MAX, 2e-4)
         budget_ctrl = BetaOnlyBudgetController(
-            target_ebops    = TARGET_EBOPS,
-            margin          = phase2_margin,  # 紧容忍带（近预算时更平滑）
-            beta_init       = phase1_final_beta,  # 从 Phase 1 均衡点出发
-            beta_min        = PHASE2_BETA_MIN,
-            beta_max        = phase2_beta_max_use,
-            adjust_factor   = phase2_adjust_factor,
-            ema_alpha       = phase2_ema,
-            warmup_epochs   = 0,              # Phase 2 无需预热（已从 Phase 1 继承）
-            max_change_ratio = 1.5,           # Phase 2 更严格的变化率限制
-            init_ebops      = TARGET_EBOPS,   # EMA 从目标值初始化
+            target_ebops  = TARGET_EBOPS,
+            margin        = phase2_margin,  # 紧容忍带（近预算时更平滑）
+            beta_init     = phase1_final_beta,  # 从 Phase 1 均衡点出发
+            beta_min      = PHASE2_BETA_MIN,
+            beta_max      = phase2_beta_max_use,
+            adjust_factor = phase2_adjust_factor,
+            ema_alpha     = phase2_ema,
         )
 
     early_stop_cb = BudgetAwareEarlyStopping(

@@ -84,10 +84,13 @@ random.seed(42)
 # BASELINE_EBOPS = 23589
 # epoch=3699-val_acc=0.770-ebops=23293-val_loss=0.640.keras
 
-BASELINE_CKPT = "results/baseline/epoch=3699-val_acc=0.770-ebops=23293-val_loss=0.640.keras"
-BASELINE_EBOPS = 23293
+# BASELINE_CKPT = "results/baseline/epoch=3699-val_acc=0.770-ebops=23293-val_loss=0.640.keras"
+# BASELINE_EBOPS = 23293
+BASELINE_CKPT = "results/baseline/epoch=7789-val_acc=0.770-ebops=19899-val_loss=0.641.keras"
+BASELINE_EBOPS = 19899
 
-TARGET_EBOPS = 500  # 最终目标（可通过命令行覆盖）
+
+TARGET_EBOPS = 1500  # 最终目标（可通过命令行覆盖）
 
 # ── 输入 ─────────────────────────────────────────────────────────────────────
 input_folder = "data/dataset.h5"

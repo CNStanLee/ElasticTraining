@@ -85,23 +85,85 @@ def _flatten_layers(model: keras.Model) -> Iterable[keras.layers.Layer]:
     return out
 
 
+def _biregular_2d_mask(in_dim, out_dim, col_degree, rng):
+    """生成双正则二部图掩膜 (bi-regular bipartite graph mask)。
+
+    保证：
+    - 每个输出（列）恰好连接 col_degree 个输入
+    - 每个输入（行）连接 floor(E/in_dim) 或 ceil(E/in_dim) 个输出
+      其中 E = col_degree * out_dim 为总边数
+    - 所有输入节点都至少有 1 条连接（当 E >= in_dim 时）
+
+    算法：贪心行优先分配，按行度降序处理，权重采样保持列度均衡。
+    """
+    col_degree = min(col_degree, in_dim)
+    total_edges = col_degree * out_dim
+
+    if col_degree >= in_dim:
+        return np.ones((in_dim, out_dim), dtype=np.float32)
+
+    # ── 计算目标行度 ──────────────────────────────────────────────────────
+    d_row_floor = total_edges // in_dim
+    remainder   = total_edges % in_dim
+
+    row_degrees = np.full(in_dim, d_row_floor, dtype=int)
+    if remainder > 0:
+        extra = rng.choice(in_dim, size=remainder, replace=False)
+        row_degrees[extra] += 1
+
+    # 安全检查：行度不超过 out_dim
+    row_degrees = np.minimum(row_degrees, out_dim)
+
+    # ── 贪心行优先分配 ────────────────────────────────────────────────────
+    mask = np.zeros((in_dim, out_dim), dtype=np.float32)
+    col_remaining = np.full(out_dim, col_degree, dtype=int)
+
+    # 按行度降序处理（高约束行先分配，保证可行性 — Erdős–Gallai）
+    row_order = np.argsort(-row_degrees)
+
+    for i in row_order:
+        d_i = int(row_degrees[i])
+        if d_i == 0:
+            continue
+
+        available = np.where(col_remaining > 0)[0]
+        if len(available) <= d_i:
+            # 可用列不够，全部取走
+            selected = available
+        else:
+            # 权重 = 列剩余容量，倾向于填充尚有空余的列
+            weights = col_remaining[available].astype(np.float64)
+            weights /= weights.sum()
+            selected = rng.choice(available, size=d_i, replace=False, p=weights)
+
+        mask[i, selected] = 1.0
+        col_remaining[selected] -= 1
+
+    # ── 修补列度（如果贪心过程中有微小偏差）────────────────────────────────
+    for j in range(out_dim):
+        actual = int(mask[:, j].sum())
+        deficit = col_degree - actual
+        if deficit > 0:
+            zeros = np.where(mask[:, j] == 0)[0]
+            if len(zeros) > 0:
+                fill = rng.choice(zeros, size=min(deficit, len(zeros)), replace=False)
+                mask[fill, j] = 1.0
+
+    return mask
+
+
 def _ramanujan_like_mask(shape, degree, rng):
-    """生成 d-regular 式稀疏掩膜（1=保留, 0=剪掉）。"""
+    """生成双正则 (bi-regular) 拉马努金式稀疏掩膜（1=保留, 0=剪掉）。
+
+    相比旧版仅保证列正则（column-regular），新版同时保证行侧度数近似均匀，
+    确保所有输入节点都被连接（当总边数 >= in_dim 时）。
+    """
     if len(shape) == 2:
         in_dim, out_dim = int(shape[0]), int(shape[1])
-        degree = min(degree, in_dim)
-        mask = np.zeros((in_dim, out_dim), dtype=np.float32)
-        for o in range(out_dim):
-            idx = rng.choice(in_dim, size=degree, replace=False)
-            mask[idx, o] = 1.0
-        return mask
+        return _biregular_2d_mask(in_dim, out_dim, degree, rng)
     elif len(shape) == 4:
         kh, kw, in_ch, out_ch = [int(x) for x in shape]
-        degree = min(degree, in_ch)
-        base = np.zeros((in_ch, out_ch), dtype=np.float32)
-        for o in range(out_ch):
-            idx = rng.choice(in_ch, size=degree, replace=False)
-            base[idx, o] = 1.0
+        base = _biregular_2d_mask(in_ch, out_ch, degree, rng)
         return np.broadcast_to(base[None, None], (kh, kw, in_ch, out_ch)).astype(np.float32)
     else:
         raise ValueError(f"Unsupported kernel shape: {shape}")
@@ -678,33 +740,105 @@ class SensitivityAwarePruner:
                   f"target={self.target_ebops:.1f}  global_alpha={global_alpha:.4f}")
 
 
-class BetaOnlyBudgetController(keras.callbacks.Callback):
-    """用 beta 自然维持 EBOPs 预算，不做均匀投影。
+class KQBStabilizer(keras.callbacks.Callback):
+    """剪枝后 kq.b 稳定器：防止初期梯度导致 EBOPs 大幅偏离目标。
 
-    核心思路
+    问题背景
     --------
-    Baseline 在连续训练中靠 beta（EBOPS 惩罚系数）+ 梯度自然达到目标 EBOPs，
-    同时保持最优的 per-layer 位宽分配。
+    一次性剪枝后，kq.b 被精确校准到目标 EBOPs。但训练一开始，分类损失的
+    梯度会把 kq.b 往上推（更多位宽 = 更低量化噪声），导致 EBOPs 在第一个
+    epoch 就远超目标。BetaOnlyBudgetController 只能在 epoch 结束后反应，已经
+    太晚了。
 
-    本 callback 复制这个机制：
-    - 当 EBOPs > target * (1 + margin) 时，自适应增大 beta 施加压缩力
-    - 当 EBOPs < target * (1 - margin) 时，减小 beta 释放压力
-    - 当 EBOPs 在容忍带内时，保持 beta 不变
+    机制
+    ----
+    在每个 epoch 结束后，将当前 kq.b 与剪枝快照做加权混合：
+        b_new = alpha * b_snapshot + (1 - alpha) * b_current
 
-    与 EBOPsConstantProjector 的区别
-    ------
-    - 投影器直接修改 kq.b，用同一个 alpha 缩放所有层 → 破坏跨层分配
-    - 本 callback 只调整 beta 标量 → HGQ 梯度自行决定各层怎么分配位宽
+    - hold_epochs 内：alpha = hold_strength（接近 1.0，几乎冻结 kq.b）
+    - release_epochs 内：alpha 从 hold_strength 线性衰减到 0（逐渐放开）
+    - 之后：不再干预，完全由梯度 + beta 控制
+
+    这让权重有时间适应低精度量化点，同时保持 EBOPs 稳定在目标附近。
 
     参数
     ----
-    target_ebops    : 目标 EBOPS
-    margin          : 容忍带宽度（默认 0.1 = ±10%）
-    beta_init       : 初始 beta（默认 1e-5）
-    beta_min        : beta 下限
-    beta_max        : beta 上限
-    adjust_factor   : 每次超标时 beta 的乘法调整因子（默认 1.3）
-    ema_alpha       : EBOPS EMA 平滑系数
+    hold_epochs     : 完全保持快照的 epoch 数（默认 30）
+    release_epochs  : 从保持到释放的过渡 epoch 数（默认 100）
+    hold_strength   : 保持强度，1.0 = 完全冻结（默认 0.8）
+    """
+
+    def __init__(self, hold_epochs: int = 30, release_epochs: int = 100,
+                 hold_strength: float = 0.8):
+        super().__init__()
+        self.hold_epochs = hold_epochs
+        self.release_epochs = release_epochs
+        self.hold_strength = hold_strength
+        self._snapshot = None  # type: dict | None
+
+    def capture_snapshot(self, model):
+        """保存当前 kq.b 值作为参考点（在剪枝校准完成后调用）。"""
+        self._snapshot = {}
+        for layer in _flatten_layers(model):
+            kq = getattr(layer, 'kq', None)
+            if kq is None:
+                continue
+            b_var = _get_kq_var(kq, 'b')
+            if b_var is None:
+                b_var = _get_kq_var(kq, 'f')
+            if b_var is not None:
+                self._snapshot[id(layer)] = (b_var, b_var.numpy().copy())
+
+    def on_epoch_end(self, epoch, logs=None):
+        if self._snapshot is None:
+            return
+        total = self.hold_epochs + self.release_epochs
+        if epoch >= total:
+            return
+
+        if epoch < self.hold_epochs:
+            alpha = self.hold_strength
+        else:
+            progress = (epoch - self.hold_epochs) / max(self.release_epochs, 1)
+            alpha = self.hold_strength * (1.0 - progress)
+
+        for b_var, b_snap in self._snapshot.values():
+            current = b_var.numpy()
+            b_new = alpha * b_snap + (1.0 - alpha) * current
+            b_var.assign(b_new.astype(np.float32))
+
+
+class BetaOnlyBudgetController(keras.callbacks.Callback):
+    """用 beta + rescue 投影维持 EBOPs 预算。
+
+    核心思路
+    --------
+    1. **beta 调节（下行通道）**：
+       - EBOPs > target → 增大 beta → 梯度压低 kq.b → EBOPs 下降
+       - EBOPs < target → 减小 beta → 释放压力
+
+    2. **rescue 投影（上行通道）**：
+       beta=0 无法 *主动* 推高 kq.b，深度剪枝后分类梯度太弱，EBOPs 会自由落体。
+       rescue 每 epoch 持续检测并施加温和的上行修正，像弹簧一样把 EBOPs 拉回目标:
+         alpha = 1 + rescue_rate * max(0, 1 - ema_ebops / target)
+       EBOPs 越低 → alpha 越大 → 修正越强，但被 rescue_max_alpha clamp。
+       触发条件: EBOPs < target * (1 - rescue_threshold)
+
+    参数
+    ----
+    target_ebops      : 目标 EBOPS
+    margin            : 容忍带宽度（默认 0.1 = ±10%）
+    beta_init/min/max : beta 范围
+    adjust_factor     : beta 乘法调整因子
+    ema_alpha         : EBOPs EMA 平滑系数
+    warmup_epochs     : 预热期 epoch 数
+    max_change_ratio  : 每 epoch beta 最大变化倍率
+    init_ebops        : 初始化 EMA 的 EBOPs 值
+    rescue_threshold  : 触发 rescue 的偏差阈值（默认 0.15 = EBOPs < 85% target）
+    rescue_rate       : rescue 修正强度系数（默认 0.3）
+    rescue_max_alpha  : rescue 单步最大放大倍率（默认 1.08）
+    rescue_b_min      : kq.b 活跃判定阈值
+    rescue_b_max      : kq.b 放大后上限
     """
 
     def __init__(
@@ -716,16 +850,33 @@ class BetaOnlyBudgetController(keras.callbacks.Callback):
         beta_max: float = 1e-3,
         adjust_factor: float = 1.3,
         ema_alpha: float = 0.3,
+        warmup_epochs: int = 0,
+        max_change_ratio: float = 0,
+        init_ebops: float = None,
+        rescue_threshold: float = 0.15,
+        rescue_rate: float = 0.3,
+        rescue_max_alpha: float = 1.08,
+        rescue_b_min: float = 0.05,
+        rescue_b_max: float = 8.0,
     ):
         super().__init__()
-        self.target_ebops  = float(target_ebops)
-        self.margin        = margin
-        self.beta_current  = float(beta_init)
-        self.beta_min      = beta_min
-        self.beta_max      = beta_max
-        self.adjust_factor = adjust_factor
-        self.ema_alpha     = ema_alpha
-        self._ebops_ema    = None
+        self.target_ebops     = float(target_ebops)
+        self.margin           = margin
+        self.beta_current     = float(beta_init)
+        self.beta_min         = beta_min
+        self.beta_max         = beta_max
+        self.adjust_factor    = adjust_factor
+        self.ema_alpha        = ema_alpha
+        self.warmup_epochs    = warmup_epochs
+        self.max_change_ratio = max_change_ratio
+        self._ebops_ema       = float(init_ebops) if init_ebops is not None else None
+        self._epoch_counter   = 0
+        # rescue 参数
+        self.rescue_threshold = rescue_threshold
+        self.rescue_rate      = rescue_rate
+        self.rescue_max_alpha = rescue_max_alpha
+        self.rescue_b_min     = rescue_b_min
+        self.rescue_b_max     = rescue_b_max
 
     def _set_beta(self, value):
         bv = tf.constant(value, dtype=tf.float32)
@@ -736,6 +887,28 @@ class BetaOnlyBudgetController(keras.callbacks.Callback):
                 except Exception:
                     pass
 
+    def _rescue_scale_kqb(self, alpha: float):
+        """直接放大所有活跃 kq.b，为 EBOPs 提供上行动力。"""
+        for layer in _flatten_layers(self.model):
+            kq = getattr(layer, 'kq', None)
+            if kq is None:
+                continue
+            b_var = _get_kq_var(kq, 'b')
+            if b_var is None:
+                b_var = _get_kq_var(kq, 'f')
+            if b_var is None:
+                continue
+            b_arr = b_var.numpy()
+            active = b_arr > self.rescue_b_min
+            if not np.any(active):
+                continue
+            b_new = np.where(
+                active,
+                np.clip(b_arr * alpha, self.rescue_b_min, self.rescue_b_max),
+                b_arr,
+            )
+            b_var.assign(b_new.astype(np.float32))
+
     def on_epoch_begin(self, epoch, logs=None):
         self._set_beta(self.beta_current)
 
@@ -744,6 +917,8 @@ class BetaOnlyBudgetController(keras.callbacks.Callback):
         raw_ebops = float(logs.get('ebops', float('nan')))
         if not math.isfinite(raw_ebops) or raw_ebops <= 0:
             return
+
+        self._epoch_counter += 1
 
         if self._ebops_ema is None:
             self._ebops_ema = raw_ebops
@@ -754,21 +929,50 @@ class BetaOnlyBudgetController(keras.callbacks.Callback):
         upper = self.target_ebops * (1.0 + self.margin)
         lower = self.target_ebops * (1.0 - self.margin)
 
+        old_beta = self.beta_current
+
+        # 预热：前 warmup_epochs 内用更温和的调整力度
+        if self.warmup_epochs > 0 and self._epoch_counter <= self.warmup_epochs:
+            warmup_scale = self._epoch_counter / self.warmup_epochs
+        else:
+            warmup_scale = 1.0
+        effective_factor = 1.0 + (self.adjust_factor - 1.0) * warmup_scale
+
         if self._ebops_ema > upper:
-            # EBOPs 超标 → 增大 beta 施加压缩力，按超额比例加速
-            overshoot = self._ebops_ema / upper
+            # EBOPs 超标 → 增大 beta 施加压缩力
             self.beta_current = min(
-                self.beta_current * self.adjust_factor * overshoot,
+                self.beta_current * effective_factor,
                 self.beta_max,
             )
         elif self._ebops_ema < lower:
-            # EBOPs 不足 → 大幅减小 beta 释放压力
-            # 按不足比例加速衰减：越低于目标，beta 降得越快
-            undershoot = lower / max(self._ebops_ema, 1.0)
+            # EBOPs 不足 → 减小 beta 释放压力
             self.beta_current = max(
-                self.beta_current / (self.adjust_factor * undershoot),
+                self.beta_current / effective_factor,
                 self.beta_min,
             )
         # else: 在容忍带内，保持不变
+
+        # 每 epoch beta 变化倍率限制，防止单步跳变过大
+        if self.max_change_ratio > 1.0 and old_beta > 0:
+            self.beta_current = float(np.clip(
+                self.beta_current,
+                old_beta / self.max_change_ratio,
+                old_beta * self.max_change_ratio,
+            ))
+
+        # ── rescue 投影：持续温和的上行修正 ──────────────────────────────
+        # EBOPs 大幅低于目标时，每 epoch 施加一小步 kq.b 放大。
+        # 修正强度与偏差成正比（弹簧模型），避免一次性大幅跳变。
+        rescue_floor = self.target_ebops * (1.0 - self.rescue_threshold)
+        if self._ebops_ema < rescue_floor:
+            # 偏差比: 1 - ema/target, e.g. ema=900, target=1500 → deviation=0.4
+            deviation = 1.0 - self._ebops_ema / self.target_ebops
+            alpha = 1.0 + self.rescue_rate * max(deviation, 0.0)
+            alpha = float(np.clip(alpha, 1.0, self.rescue_max_alpha))
+            if alpha > 1.001:
+                self._rescue_scale_kqb(alpha)
+                # rescue 后把 beta 压到最低，避免刚推上来又被压下去
+                self.beta_current = self.beta_min
+                logs['rescue_alpha'] = alpha
 
         logs['beta_budget'] = self.beta_current
