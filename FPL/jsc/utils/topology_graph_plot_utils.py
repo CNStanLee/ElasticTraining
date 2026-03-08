@@ -116,7 +116,13 @@ class TopologyGraphPlotter:
             )
         return out
 
-    def plot_weighted_topology_matrices(self, layers: list[LayerGraphData], out_png: Path) -> None:
+    def plot_weighted_topology_matrices(
+        self,
+        layers: list[LayerGraphData],
+        out_png: Path,
+        title: str | None = None,
+        subtitle: str | None = None,
+    ) -> None:
         if not layers:
             raise RuntimeError("No quantized kernel layers found in model.")
 
@@ -141,16 +147,26 @@ class TopologyGraphPlotter:
 
         cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.88, pad=0.02)
         cbar.set_label("Edge score (bit * |weight|)")
-        fig.suptitle(
+        title_text = title or (
             "Weighted Topology Connectivity Matrices"
             + (" (symmetric view)" if self.symmetric_topology_plot else "")
         )
+        if subtitle:
+            fig.suptitle(f"{title_text}\n{subtitle}")
+        else:
+            fig.suptitle(title_text)
         fig.subplots_adjust(left=0.05, right=0.94, top=0.84, bottom=0.12, wspace=0.22)
         out_png.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_png, dpi=180)
         plt.close(fig)
 
-    def plot_circle_graph(self, layers: list[LayerGraphData], out_png: Path) -> None:
+    def plot_circle_graph(
+        self,
+        layers: list[LayerGraphData],
+        out_png: Path,
+        title: str | None = None,
+        subtitle: str | None = None,
+    ) -> None:
         if not layers:
             raise RuntimeError("No quantized kernel layers found in model.")
 
@@ -223,10 +239,14 @@ class TopologyGraphPlotter:
         ax.set_xticks([])
         ax.set_yticks([])
         ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8, alpha=0.4)
-        ax.set_title(
+        title_text = title or (
             f"Weighted Circle Connection Graph (active edges={total_edges})"
             + (" (mirror view)" if self.mirror_edges else "")
         )
+        if subtitle:
+            ax.set_title(f"{title_text}\n{subtitle}")
+        else:
+            ax.set_title(title_text)
         ax.set_frame_on(False)
 
         fig.tight_layout()

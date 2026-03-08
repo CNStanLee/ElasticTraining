@@ -29,7 +29,9 @@ from utils.ramanujan_budget_utils import (
     _get_kq_var,
 )
 from run_one_shot_prune_only import (
+    saliency_prune_to_ebops,
     spectral_quant_prune_to_ebops,
+    snows_prune_to_ebops,
     bisect_ebops_to_target,
     teacher_guided_post_prune_calibration,
 )
@@ -52,8 +54,12 @@ TARGET_EBOPS = 1000
 # ── 剪枝方式 ──────────────────────────────────────────────────────────────────
 # 'uniform'        : 旧方案 HighBitPruner (均匀缩放，有精度损失)
 # 'sensitivity'    : 按层敏感度分配预算
+# 'snip'           : 单次梯度连接敏感度 |dL/dw * w|
+# 'grasp'          : 梯度流保持的 Hessian-gradient saliency
+# 'synflow'        : data-free synaptic flow saliency
 # 'spectral_quant' : 谱/拓扑友好剪枝（低预算会自动走结构化子网络）
-PRUNE_METHOD = 'sensitivity'
+# 'snows'          : sensitivity/spectral warm-start + Hessian-free K-step representation reconstruction
+PRUNE_METHOD = 'snows'
 
 input_folder = 'data/dataset.h5'
 batch_size   = 33200
@@ -102,7 +108,7 @@ parser.add_argument('--phase1_epochs', type=int,   default=PHASE1_EPOCHS)
 parser.add_argument('--phase2_epochs', type=int,   default=PHASE2_EPOCHS)
 parser.add_argument('--checkpoint',    type=str,   default=BASELINE_CKPT)
 parser.add_argument('--prune_method',  type=str,   default=PRUNE_METHOD,
-                    choices=['uniform', 'sensitivity', 'spectral_quant'])
+                    choices=['uniform', 'sensitivity', 'snip', 'grasp', 'synflow', 'spectral_quant', 'snows'])
 parser.add_argument('--auto_warm_start', action='store_true', default=True,
                     help='Auto pick a near-budget warm-start checkpoint for low-budget training')
 parser.add_argument('--no_auto_warm_start', action='store_true',
@@ -117,6 +123,17 @@ parser.add_argument('--no_functional_calibrate', action='store_true',
                     help='Disable teacher-guided functional calibration')
 parser.add_argument('--functional_passes', type=int, default=2,
                     help='Number of teacher-guided calibration passes after pruning')
+parser.add_argument('--snows_init_method', type=str, default='sensitivity',
+                    choices=['uniform', 'sensitivity', 'spectral_quant'],
+                    help='Initial budget allocation used before SNOWS reconstruction')
+parser.add_argument('--snows_k_step', type=int, default=2,
+                    help='SNOWS look-ahead horizon in prunable layers')
+parser.add_argument('--snows_newton_steps', type=int, default=2,
+                    help='SNOWS Newton updates per layer')
+parser.add_argument('--snows_cg_iters', type=int, default=25,
+                    help='Maximum conjugate-gradient iterations for SNOWS')
+parser.add_argument('--snows_damping', type=float, default=1e-4,
+                    help='SNOWS Hessian-free damping')
 args, _ = parser.parse_known_args()
 
 TARGET_EBOPS    = args.target_ebops
@@ -397,6 +414,10 @@ if __name__ == '__main__':
     print(f'  Target      : ebops = {TARGET_EBOPS}')
     print(f'  Prune method: {PRUNE_METHOD}')
     print(f'  Func-calib  : {args.functional_calibrate} (passes={args.functional_passes})')
+    if PRUNE_METHOD == 'snows':
+        print(f'  SNOWS init  : {args.snows_init_method}')
+        print(f'  SNOWS K     : {args.snows_k_step}')
+        print(f'  SNOWS Newton: {args.snows_newton_steps} x CG{args.snows_cg_iters}')
     print(f'  Phase1      : {PHASE1_EPOCHS} epochs  (recovery,  beta auto [{PHASE1_BETA_INIT:.1e}~{PHASE1_BETA_MAX:.1e}])')
     print(f'  Phase2      : {PHASE2_EPOCHS} epochs  (acc-max,   beta auto [{PHASE2_BETA_INIT:.1e}~{PHASE2_BETA_MAX:.1e}])')
     print(f'  Output      : {output_folder}')
@@ -427,12 +448,39 @@ if __name__ == '__main__':
     print(f'\n[3/5] One-shot bit-width pruning ({PRUNE_METHOD}): '
           f'{actual_baseline_ebops:.1f} -> {TARGET_EBOPS}')
     used_structured_low_budget = False
+    snows_report = None
     if PRUNE_METHOD == 'sensitivity':
         pruner = SensitivityAwarePruner(target_ebops=TARGET_EBOPS, pruned_threshold=0.1, b_k_min=0.3)
         pruner.prune_to_ebops(model, current_ebops=actual_baseline_ebops, verbose=True)
     elif PRUNE_METHOD == 'uniform':
         pruner = HighBitPruner(target_ebops=TARGET_EBOPS, pruned_threshold=0.1)
         pruner.prune_to_ebops(model, current_ebops=actual_baseline_ebops, verbose=True)
+    elif PRUNE_METHOD in {'snip', 'grasp', 'synflow'}:
+        saliency_prune_to_ebops(
+            model,
+            target_ebops=TARGET_EBOPS,
+            sample_input=_sample_input,
+            method=PRUNE_METHOD,
+            input_h5=input_folder,
+            sample_size=min(512, int(_sample_input.shape[0])),
+            b_floor=0.35,
+            verbose=True,
+        )
+    elif PRUNE_METHOD == 'snows':
+        _, snows_report = snows_prune_to_ebops(
+            model,
+            teacher_model=teacher_model,
+            target_ebops=TARGET_EBOPS,
+            sample_input=_sample_input,
+            init_method=args.snows_init_method,
+            b_floor=0.30,
+            k_step=args.snows_k_step,
+            newton_steps=args.snows_newton_steps,
+            cg_max_iter=args.snows_cg_iters,
+            damping=args.snows_damping,
+            verbose=True,
+        )
+        used_structured_low_budget = bool(snows_report.get('used_structured_low_budget', False))
     else:
         _, used_structured_low_budget = spectral_quant_prune_to_ebops(
             model,
@@ -451,6 +499,12 @@ if __name__ == '__main__':
     # 实测剪枝后 EBOPs，迭代修正到目标 ±3%
     post_prune_ebops = compute_model_ebops(model, _sample_input)
     print(f'  Post-prune EBOPs (measured): {post_prune_ebops:.1f}  target: {TARGET_EBOPS}')
+    if snows_report is not None:
+        print(
+            f"  SNOWS repr-loss sum: "
+            f"{snows_report['representation_loss_before_sum']:.6f} -> "
+            f"{snows_report['representation_loss_after_sum']:.6f}"
+        )
     near_budget_preserve_case = (
         PRUNE_METHOD == 'spectral_quant'
         and (not used_structured_low_budget)

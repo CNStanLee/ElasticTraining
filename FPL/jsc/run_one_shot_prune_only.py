@@ -6,7 +6,7 @@ run_one_shot_prune_only.py
 
 流程：
 1) 加载 checkpoint
-2) 执行 one-shot pruning（uniform / sensitivity）
+2) 执行 one-shot pruning（uniform / sensitivity / SNIP / GraSP / SynFlow / ...）
 3) 通过一次前向传播实测 EBOPs
 4) 保存权重与元信息
 """
@@ -214,6 +214,52 @@ def _apply_mask_and_quant(
             bk_var.assign(bk_new)
 
 
+def _apply_mask_preserve_quant(layer, mask: np.ndarray):
+    """Apply a binary mask while preserving surviving quantizer state.
+
+    This is closer to the original pruning baselines, which choose a mask but do
+    not re-optimize or re-assign the remaining weights/quantizers at prune time.
+    """
+    kernel = np.array(layer.kernel.numpy(), dtype=np.float32)
+    m = mask.astype(np.float32)
+    layer.kernel.assign((kernel * m).astype(np.float32))
+
+    kq = layer.kq
+    b_var = _get_kq_var(kq, "b")
+    if b_var is None:
+        b_var = _get_kq_var(kq, "f")
+    i_var = _get_kq_var(kq, "i")
+    k_var = _get_kq_var(kq, "k")
+
+    if b_var is not None:
+        b_old = np.array(b_var.numpy(), dtype=np.float32)
+        b_var.assign(np.where(m > 0.5, b_old, 0.0).astype(np.float32))
+    if i_var is not None:
+        i_old = np.array(i_var.numpy(), dtype=np.float32)
+        i_var.assign(np.where(m > 0.5, i_old, -16.0).astype(np.float32))
+    if k_var is not None:
+        k_old = np.array(k_var.numpy(), dtype=np.float32)
+        k_var.assign(np.where(m > 0.5, k_old, 0.0).astype(np.float32))
+
+    bq = getattr(layer, "bq", None)
+    if bq is not None:
+        cols_active = np.sum(m, axis=0) > 0.5
+        bb_var = _get_kq_var(bq, "b")
+        if bb_var is None:
+            bb_var = _get_kq_var(bq, "f")
+        bi_var = _get_kq_var(bq, "i")
+        bk_var = _get_kq_var(bq, "k")
+        if bb_var is not None:
+            bb_old = np.array(bb_var.numpy(), dtype=np.float32)
+            bb_var.assign(np.where(cols_active, bb_old, 0.0).astype(np.float32))
+        if bi_var is not None:
+            bi_old = np.array(bi_var.numpy(), dtype=np.float32)
+            bi_var.assign(np.where(cols_active, bi_old, -16.0).astype(np.float32))
+        if bk_var is not None:
+            bk_old = np.array(bk_var.numpy(), dtype=np.float32)
+            bk_var.assign(np.where(cols_active, bk_old, 0.0).astype(np.float32))
+
+
 def _collect_named_outputs(model, layer_names, sample_input, training=False):
     outputs = [model.get_layer(n).output for n in layer_names]
     probe = keras.Model(model.inputs, outputs)
@@ -290,6 +336,772 @@ def _reestimate_quantizer_ranges(
         if bk_var is not None:
             bk_new = np.where(cols_active, 1.0, 0.0).astype(np.float32)
             bk_var.assign(bk_new)
+
+
+def _bias_active_mask(layer, fallback_mask: np.ndarray | None = None) -> np.ndarray | None:
+    bq = getattr(layer, "bq", None)
+    if bq is None:
+        return fallback_mask
+
+    bb_var = _get_kq_var(bq, "b")
+    if bb_var is None:
+        bb_var = _get_kq_var(bq, "f")
+    bk_var = _get_kq_var(bq, "k")
+
+    if bb_var is None:
+        return fallback_mask
+
+    bb_np = np.array(bb_var.numpy(), dtype=np.float32)
+    if bk_var is not None:
+        bk_np = np.array(bk_var.numpy(), dtype=np.float32)
+        return ((bb_np > 0.0) | (bk_np > 0.0)).astype(bool)
+    return (bb_np > 0.0).astype(bool)
+
+
+def _labels_to_sparse(y_np: np.ndarray) -> np.ndarray:
+    y_np = np.array(y_np)
+    if y_np.ndim >= 2 and y_np.shape[-1] > 1:
+        return np.argmax(y_np, axis=-1).astype(np.int32)
+    return y_np.reshape(-1).astype(np.int32)
+
+
+def build_prune_batch(
+    model,
+    sample_size: int,
+    input_h5: str | None,
+    teacher_model=None,
+):
+    """Build a supervised pruning batch; fall back to teacher pseudo labels."""
+    if input_h5 and os.path.exists(input_h5):
+        (_, _), (x_val, y_val), _ = get_data(input_h5, src='openml')
+        n = min(sample_size, len(x_val))
+        x = tf.constant(x_val[:n], dtype=tf.float32)
+        y = tf.constant(_labels_to_sparse(y_val[:n]), dtype=tf.int32)
+        return x, y, f"dataset:{input_h5}"
+
+    x, src = build_sample_input(model, sample_size, input_h5)
+    teacher = teacher_model if teacher_model is not None else model
+    logits = teacher(x, training=False)
+    y = tf.cast(tf.argmax(logits, axis=-1), tf.int32)
+    return x, y, f"{src}:pseudo"
+
+
+def _snapshot_prunable_state(model):
+    snapshots = []
+    for layer in _dense_prunable_layers(model):
+        snap = {
+            "layer": layer,
+            "kernel": np.array(layer.kernel.numpy(), dtype=np.float32),
+        }
+        bias = getattr(layer, "bias", None)
+        if bias is not None:
+            snap["bias"] = np.array(bias.numpy(), dtype=np.float32)
+
+        for prefix, qobj in (("kq", getattr(layer, "kq", None)), ("bq", getattr(layer, "bq", None))):
+            if qobj is None:
+                continue
+            for name in ("b", "f", "i", "k"):
+                var = _get_kq_var(qobj, name)
+                if var is not None:
+                    snap[f"{prefix}.{name}"] = (var, np.array(var.numpy(), dtype=np.float32))
+        snapshots.append(snap)
+    return snapshots
+
+
+def _restore_prunable_state(snapshots):
+    for snap in snapshots:
+        layer = snap["layer"]
+        layer.kernel.assign(snap["kernel"])
+        bias = getattr(layer, "bias", None)
+        if bias is not None and "bias" in snap:
+            bias.assign(snap["bias"])
+        for key, value in snap.items():
+            if key in {"layer", "kernel", "bias"}:
+                continue
+            var, arr = value
+            var.assign(arr)
+
+
+def _active_kernel_mask_from_scores(layer, scores: np.ndarray) -> np.ndarray:
+    active = _layer_active_mask(layer).astype(bool)
+    if scores.shape != active.shape:
+        raise ValueError(f"Score shape mismatch for layer {layer.name}: {scores.shape} vs {active.shape}")
+    return active
+
+
+def _global_topk_masks(score_items, keep_count: int):
+    total_active = int(sum(int(np.sum(item["active"])) for item in score_items))
+    keep_count = int(np.clip(keep_count, 0, total_active))
+    if keep_count <= 0:
+        return {id(item["layer"]): np.zeros_like(item["scores"], dtype=np.float32) for item in score_items}
+
+    flat_scores = []
+    for idx, item in enumerate(score_items):
+        active_pos = np.flatnonzero(item["active"].reshape(-1))
+        if active_pos.size == 0:
+            continue
+        vals = item["scores"].reshape(-1)[active_pos]
+        vals = np.nan_to_num(vals, nan=-1e30, posinf=1e30, neginf=-1e30).astype(np.float32)
+        for pos, val in zip(active_pos.tolist(), vals.tolist()):
+            flat_scores.append((float(val), idx, int(pos)))
+
+    if not flat_scores:
+        return {id(item["layer"]): np.zeros_like(item["scores"], dtype=np.float32) for item in score_items}
+
+    flat_scores.sort(key=lambda x: x[0], reverse=True)
+    keep_set = {(idx, pos) for _, idx, pos in flat_scores[:keep_count]}
+    masks = {}
+    for idx, item in enumerate(score_items):
+        mask = np.zeros(item["scores"].shape, dtype=np.float32)
+        active_pos = np.flatnonzero(item["active"].reshape(-1))
+        for pos in active_pos.tolist():
+            if (idx, pos) in keep_set:
+                mask.reshape(-1)[pos] = 1.0
+        masks[id(item["layer"])] = mask
+    return masks
+
+
+def _saliency_loss(logits, labels):
+    loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    return loss_fn(labels, logits)
+
+
+def _normalize_scores(score_map: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    total = 0.0
+    for arr in score_map.values():
+        total += float(np.sum(np.abs(np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0))))
+    denom = max(total, 1e-12)
+    return {
+        name: np.abs(np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)).astype(np.float32) / denom
+        for name, arr in score_map.items()
+    }
+
+
+def _saliency_scores_snip(model, dense_layers, x_batch, y_batch):
+    params = [layer.kernel for layer in dense_layers]
+    with tf.GradientTape() as tape:
+        logits = model(x_batch, training=False)
+        loss = _saliency_loss(logits, y_batch)
+    grads = tape.gradient(loss, params)
+
+    scores = {}
+    for layer, grad in zip(dense_layers, grads):
+        grad_np = np.zeros(tuple(layer.kernel.shape), dtype=np.float32) if grad is None else np.array(grad.numpy(), dtype=np.float32)
+        w_np = np.array(layer.kernel.numpy(), dtype=np.float32)
+        scores[layer.name] = np.abs(w_np * grad_np).astype(np.float32)
+    return _normalize_scores(scores), {"loss": float(loss.numpy())}
+
+
+def _saliency_scores_grasp(model, dense_layers, x_batch, y_batch):
+    params = [layer.kernel for layer in dense_layers]
+    n = int(x_batch.shape[0]) if x_batch.shape[0] is not None else int(tf.shape(x_batch)[0].numpy())
+    mid = max(1, n // 2)
+    if n >= 2:
+        x_a, y_a = x_batch[:mid], y_batch[:mid]
+        x_b, y_b = x_batch[mid:], y_batch[mid:]
+        if int(x_b.shape[0]) == 0:
+            x_b, y_b = x_a, y_a
+    else:
+        x_a = x_b = x_batch
+        y_a = y_b = y_batch
+
+    with tf.GradientTape() as ref_tape:
+        logits_b = model(x_b, training=False)
+        loss_b = _saliency_loss(logits_b, y_b)
+    grads_b = ref_tape.gradient(loss_b, params)
+
+    with tf.GradientTape() as outer_tape:
+        with tf.GradientTape() as inner_tape:
+            logits_a = model(x_a, training=False)
+            loss_a = _saliency_loss(logits_a, y_a)
+        grads_a = inner_tape.gradient(loss_a, params)
+        z_terms = []
+        for ga, gb in zip(grads_a, grads_b):
+            if ga is None or gb is None:
+                continue
+            z_terms.append(tf.reduce_sum(ga * tf.stop_gradient(gb)))
+        z = tf.add_n(z_terms) if z_terms else tf.constant(0.0, dtype=loss_a.dtype)
+    hg = outer_tape.gradient(z, params)
+
+    scores = {}
+    for layer, hgv in zip(dense_layers, hg):
+        hvp_np = np.zeros(tuple(layer.kernel.shape), dtype=np.float32) if hgv is None else np.array(hgv.numpy(), dtype=np.float32)
+        w_np = np.array(layer.kernel.numpy(), dtype=np.float32)
+        scores[layer.name] = (-w_np * hvp_np).astype(np.float32)
+    return _normalize_scores(scores), {"loss_a": float(loss_a.numpy()), "loss_b": float(loss_b.numpy())}
+
+
+def _saliency_scores_synflow(model, dense_layers, sample_input):
+    params = [layer.kernel for layer in dense_layers]
+    backups = []
+    for layer in _flatten_layers(model):
+        for attr in ("kernel", "bias"):
+            var = getattr(layer, attr, None)
+            if var is None:
+                continue
+            arr = np.array(var.numpy(), dtype=np.float32)
+            backups.append((var, arr))
+            var.assign(np.abs(arr).astype(np.float32))
+
+    try:
+        ones = tf.ones_like(sample_input)
+        with tf.GradientTape() as tape:
+            logits = model(ones, training=False)
+            syn_obj = tf.reduce_sum(logits)
+        grads = tape.gradient(syn_obj, params)
+        scores = {}
+        for layer, grad in zip(dense_layers, grads):
+            grad_np = np.zeros(tuple(layer.kernel.shape), dtype=np.float32) if grad is None else np.array(grad.numpy(), dtype=np.float32)
+            w_np = np.abs(np.array(layer.kernel.numpy(), dtype=np.float32))
+            scores[layer.name] = np.abs(w_np * grad_np).astype(np.float32)
+    finally:
+        for var, arr in backups:
+            var.assign(arr)
+
+    return _normalize_scores(scores), {"synflow_objective": float(syn_obj.numpy())}
+
+
+def saliency_prune_to_ebops(
+    model,
+    target_ebops: float,
+    sample_input,
+    method: str,
+    input_h5: str | None = None,
+    sample_size: int = 512,
+    b_floor: float = 0.35,
+    verbose: bool = True,
+):
+    """Saliency pruning baselines with algorithms closer to original papers.
+
+    - SNIP: one-shot connection sensitivity on a supervised mini-batch.
+    - GraSP: one-shot gradient-signal-preservation score with Hessian-gradient proxy.
+    - SynFlow: iterative data-free pruning with linearized positive network.
+    """
+    method = str(method).lower()
+    if method not in {"snip", "grasp", "synflow"}:
+        raise ValueError(f"Unsupported saliency prune method: {method}")
+
+    dense_layers = _dense_prunable_layers(model)
+    if not dense_layers:
+        return compute_model_ebops(model, sample_input), {"method": method, "status": "no_prunable_layers"}
+
+    x_batch, y_batch, batch_src = build_prune_batch(
+        model,
+        sample_size=int(sample_size),
+        input_h5=input_h5,
+        teacher_model=model,
+    )
+
+    def collect_score_items(score_map):
+        items = []
+        total = 0
+        for layer in dense_layers:
+            scores = np.array(score_map[layer.name], dtype=np.float32)
+            active = _active_kernel_mask_from_scores(layer, scores)
+            items.append({"layer": layer, "scores": scores, "active": active})
+            total += int(np.sum(active))
+        return items, total
+
+    snapshots = _snapshot_prunable_state(model)
+
+    def apply_masks(masks_by_layer):
+        _restore_prunable_state(snapshots)
+        for item in masks_by_layer:
+            _apply_mask_preserve_quant(item["layer"], item["mask"])
+        return compute_model_ebops(model, sample_input)
+
+    if method in {"snip", "grasp"}:
+        if method == "snip":
+            score_map, score_meta = _saliency_scores_snip(model, dense_layers, x_batch, y_batch)
+        else:
+            score_map, score_meta = _saliency_scores_grasp(model, dense_layers, x_batch, y_batch)
+
+        score_items, total_active = collect_score_items(score_map)
+        if total_active <= 0:
+            cur = compute_model_ebops(model, sample_input)
+            return cur, {
+                "method": method,
+                "batch_source": batch_src,
+                "sample_size": int(x_batch.shape[0]),
+                "target_ebops": float(target_ebops),
+                "pre_bisect_ebops": float(cur),
+                "kept_connections": 0,
+                "total_active_connections": 0,
+                "score_meta": score_meta,
+                "layers": [],
+                "status": "no_active_connections",
+            }
+
+        def measure_keep(keep_count: int):
+            masks = _global_topk_masks(score_items, keep_count=keep_count)
+            eb = apply_masks(
+                [{"layer": item["layer"], "mask": masks[id(item["layer"])]} for item in score_items]
+            )
+            return eb, masks
+
+        lo, hi = 0, total_active
+        best_keep = total_active
+        best_ebops = None
+        best_masks = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            eb, masks = measure_keep(mid)
+            if eb <= float(target_ebops):
+                best_keep = mid
+                best_ebops = eb
+                best_masks = masks
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        if best_ebops is None:
+            best_keep = max(0, hi)
+            best_ebops, best_masks = measure_keep(best_keep)
+        else:
+            apply_masks(
+                [{"layer": item["layer"], "mask": best_masks[id(item["layer"])]} for item in score_items]
+            )
+
+        if verbose:
+            print(
+                f"[{method.upper()}] batch={batch_src}  keep={best_keep}/{total_active}  "
+                f"pre_bisect_ebops={best_ebops:.1f}  target={float(target_ebops):.1f}"
+            )
+
+        layer_reports = []
+        for item in score_items:
+            kept_mask = best_masks[id(item["layer"])]
+            score_vals = np.nan_to_num(item["scores"][item["active"]], nan=0.0, posinf=0.0, neginf=0.0)
+            layer_reports.append(
+                {
+                    "layer": item["layer"].name,
+                    "active_before": int(np.sum(item["active"])),
+                    "active_after": int(np.sum(kept_mask > 0.5)),
+                    "score_mean": float(np.mean(score_vals)) if score_vals.size else 0.0,
+                    "score_max": float(np.max(score_vals)) if score_vals.size else 0.0,
+                }
+            )
+
+        return float(best_ebops), {
+            "method": method,
+            "batch_source": batch_src,
+            "sample_size": int(x_batch.shape[0]),
+            "target_ebops": float(target_ebops),
+            "pre_bisect_ebops": float(best_ebops),
+            "kept_connections": int(best_keep),
+            "total_active_connections": int(total_active),
+            "score_meta": score_meta,
+            "layers": layer_reports,
+        }
+
+    current_ebops = compute_model_ebops(model, sample_input)
+    current_masks = {id(layer): _layer_active_mask(layer).astype(np.float32) for layer in dense_layers}
+    initial_masks = {k: v.copy() for k, v in current_masks.items()}
+    initial_active = int(sum(int(np.sum(m > 0.5)) for m in current_masks.values()))
+    step_reports = []
+    synflow_steps = 0
+    while current_ebops > float(target_ebops):
+        synflow_steps += 1
+        score_map, score_meta = _saliency_scores_synflow(model, dense_layers, sample_input=x_batch)
+        score_items, total_active = collect_score_items(score_map)
+        if total_active <= 1:
+            break
+
+        overshoot_ratio = max(current_ebops / max(float(target_ebops), 1.0) - 1.0, 0.0)
+        prune_frac = float(np.clip(0.02 + 0.20 * overshoot_ratio, 0.01, 0.20))
+        drop_count = max(1, int(round(total_active * prune_frac)))
+        keep_count = max(0, total_active - drop_count)
+        masks = _global_topk_masks(score_items, keep_count=keep_count)
+        current_ebops = apply_masks(
+            [{"layer": item["layer"], "mask": masks[id(item["layer"])]} for item in score_items]
+        )
+        current_masks = masks
+        step_reports.append(
+            {
+                "step": synflow_steps,
+                "active_connections": int(keep_count),
+                "pre_bisect_ebops": float(current_ebops),
+                "prune_frac": float(prune_frac),
+                "score_meta": score_meta,
+            }
+        )
+        if verbose:
+            print(
+                f"[SYNFLOW] step={synflow_steps:02d}  prune_frac={prune_frac:.3f}  "
+                f"active={keep_count}/{total_active}  ebops={current_ebops:.1f}"
+            )
+        if synflow_steps >= 64:
+            break
+
+    layer_reports = []
+    total_active_after = 0
+    for layer in dense_layers:
+        mask = current_masks[id(layer)]
+        total_active_after += int(np.sum(mask > 0.5))
+        layer_reports.append(
+            {
+                "layer": layer.name,
+                "active_before": int(np.sum(initial_masks[id(layer)] > 0.5)),
+                "active_after": int(np.sum(mask > 0.5)),
+            }
+        )
+
+    return float(current_ebops), {
+        "method": method,
+        "batch_source": batch_src,
+        "sample_size": int(x_batch.shape[0]),
+        "target_ebops": float(target_ebops),
+        "pre_bisect_ebops": float(current_ebops),
+        "kept_connections": int(total_active_after),
+        "total_active_connections": int(initial_active),
+        "iterations": int(synflow_steps),
+        "layers": layer_reports,
+        "steps": step_reports,
+    }
+
+
+def _conjugate_gradient_np(hvp_fn, b: np.ndarray, tol: float = 1e-4, max_iter: int = 25):
+    x = np.zeros_like(b, dtype=np.float32)
+    r = b.astype(np.float32, copy=True)
+    p = r.copy()
+    rs_old = float(np.dot(r, r))
+
+    if (not np.isfinite(rs_old)) or rs_old <= tol * tol:
+        return x, {"iters": 0, "residual": float(np.sqrt(max(rs_old, 0.0))), "converged": True}
+
+    converged = False
+    iters = 0
+    for it in range(max(1, int(max_iter))):
+        Ap = np.asarray(hvp_fn(p), dtype=np.float32)
+        denom = float(np.dot(p, Ap))
+        if (not np.isfinite(denom)) or abs(denom) < 1e-12:
+            break
+
+        alpha = rs_old / denom
+        if not np.isfinite(alpha):
+            break
+
+        x = x + alpha * p
+        r = r - alpha * Ap
+        rs_new = float(np.dot(r, r))
+        iters = it + 1
+
+        if (not np.isfinite(rs_new)) or np.sqrt(max(rs_new, 0.0)) <= tol:
+            converged = np.isfinite(rs_new)
+            rs_old = rs_new
+            break
+
+        beta = rs_new / max(rs_old, 1e-12)
+        p = r + beta * p
+        rs_old = rs_new
+
+    return x, {
+        "iters": int(iters),
+        "residual": float(np.sqrt(max(rs_old, 0.0))),
+        "converged": bool(converged),
+    }
+
+
+def _snows_make_loss_fn(model, layer_names, teacher_targets, sample_input):
+    probe = keras.Model(model.inputs, [model.get_layer(n).output for n in layer_names])
+    teacher_targets_tf = [tf.constant(np.array(t, dtype=np.float32)) for t in teacher_targets]
+
+    def loss_fn():
+        preds = probe(sample_input, training=False)
+        if not isinstance(preds, (list, tuple)):
+            preds = [preds]
+        losses = []
+        for pred, target in zip(preds, teacher_targets_tf):
+            denom = tf.reduce_mean(tf.square(target)) + tf.constant(1e-6, dtype=pred.dtype)
+            losses.append(tf.reduce_mean(tf.square(pred - target)) / denom)
+        return tf.add_n(losses) / float(max(len(losses), 1))
+
+    return loss_fn
+
+
+def _snows_optimize_layer(
+    model,
+    layer,
+    loss_fn,
+    newton_steps: int,
+    cg_max_iter: int,
+    damping: float,
+    line_search_decay: float,
+    line_search_c: float,
+    line_search_max_steps: int,
+    verbose: bool,
+):
+    kernel_mask = _layer_active_mask(layer).astype(bool)
+    if kernel_mask.ndim != 2 or int(np.sum(kernel_mask)) == 0:
+        return {
+            "layer": layer.name,
+            "status": "skipped",
+            "reason": "no_active_kernel",
+        }
+
+    vars_to_opt = [layer.kernel]
+    infos = [{
+        "name": f"{layer.name}.kernel",
+        "shape": tuple(layer.kernel.shape),
+        "mask_bool": kernel_mask,
+        "mask_float": kernel_mask.astype(np.float32),
+        "size": int(np.sum(kernel_mask)),
+    }]
+
+    bias = getattr(layer, "bias", None)
+    if bias is not None:
+        bias_mask = _bias_active_mask(layer, fallback_mask=(np.sum(kernel_mask, axis=0) > 0))
+        if bias_mask is not None and int(np.sum(bias_mask)) > 0:
+            vars_to_opt.append(bias)
+            infos.append({
+                "name": f"{layer.name}.bias",
+                "shape": tuple(bias.shape),
+                "mask_bool": bias_mask.astype(bool),
+                "mask_float": bias_mask.astype(np.float32),
+                "size": int(np.sum(bias_mask)),
+            })
+
+    total_active = int(sum(info["size"] for info in infos))
+    if total_active <= 0:
+        return {
+            "layer": layer.name,
+            "status": "skipped",
+            "reason": "no_active_params",
+        }
+
+    def pack(parts):
+        flat = []
+        for part, info in zip(parts, infos):
+            arr = np.array(part.numpy() if hasattr(part, "numpy") else part, dtype=np.float32)
+            if info["size"] > 0:
+                flat.append(arr[info["mask_bool"]].reshape(-1))
+        return np.concatenate(flat, axis=0) if flat else np.zeros((0,), dtype=np.float32)
+
+    def unpack(vec):
+        parts = []
+        offset = 0
+        for info, var in zip(infos, vars_to_opt):
+            full = np.zeros(info["shape"], dtype=np.float32)
+            n = info["size"]
+            if n > 0:
+                full[info["mask_bool"]] = vec[offset:offset + n]
+                offset += n
+            parts.append(tf.convert_to_tensor(full, dtype=var.dtype))
+        return parts
+
+    base_loss = float(loss_fn().numpy())
+    report = {
+        "layer": layer.name,
+        "status": "ok",
+        "active_params": total_active,
+        "loss_before": base_loss,
+        "loss_after": base_loss,
+        "steps_run": 0,
+        "cg_iters_last": 0,
+        "line_search_alpha_last": 0.0,
+    }
+
+    for step in range(max(1, int(newton_steps))):
+        with tf.GradientTape(persistent=True) as outer_tape:
+            with tf.GradientTape() as inner_tape:
+                loss = loss_fn()
+            grads = inner_tape.gradient(loss, vars_to_opt)
+            masked_grads = []
+            for grad, var, info in zip(grads, vars_to_opt, infos):
+                if grad is None:
+                    grad = tf.zeros_like(var)
+                masked_grads.append(grad * tf.convert_to_tensor(info["mask_float"], dtype=grad.dtype))
+
+        grad_vec = pack(masked_grads)
+        grad_norm = float(np.linalg.norm(grad_vec))
+        if (not np.isfinite(grad_norm)) or grad_norm < 1e-8:
+            del outer_tape
+            break
+
+        def hvp_fn(vec_np: np.ndarray):
+            vec_parts = unpack(vec_np)
+            dot_terms = [
+                tf.reduce_sum(g * tf.stop_gradient(v))
+                for g, v in zip(masked_grads, vec_parts)
+            ]
+            dot = tf.add_n(dot_terms) if dot_terms else tf.constant(0.0, dtype=loss.dtype)
+            hvps = outer_tape.gradient(dot, vars_to_opt)
+            packed = []
+            for hvp, vec_part, var, info in zip(hvps, vec_parts, vars_to_opt, infos):
+                if hvp is None:
+                    hvp = tf.zeros_like(var)
+                masked = (hvp + tf.cast(damping, hvp.dtype) * vec_part) * tf.convert_to_tensor(
+                    info["mask_float"], dtype=hvp.dtype
+                )
+                packed.append(np.array(masked.numpy(), dtype=np.float32)[info["mask_bool"]].reshape(-1))
+            return np.concatenate(packed, axis=0) if packed else np.zeros((0,), dtype=np.float32)
+
+        step_vec, cg_info = _conjugate_gradient_np(
+            hvp_fn,
+            -grad_vec,
+            tol=max(1e-6, grad_norm * 1e-2),
+            max_iter=cg_max_iter,
+        )
+
+        if step_vec.size == 0 or not np.all(np.isfinite(step_vec)):
+            del outer_tape
+            break
+
+        if float(np.dot(grad_vec, step_vec)) >= 0.0:
+            step_vec = -grad_vec
+
+        step_parts = unpack(step_vec)
+        base_values = [np.array(var.numpy(), dtype=np.float32) for var in vars_to_opt]
+        direction_dot = 0.0
+        for grad, step_part in zip(masked_grads, step_parts):
+            direction_dot += float(np.sum(np.array(grad.numpy(), dtype=np.float32) * np.array(step_part.numpy(), dtype=np.float32)))
+
+        current_loss = float(loss.numpy())
+        accepted = False
+        alpha = 1.0
+        trial_loss = current_loss
+        for _ in range(max(1, int(line_search_max_steps))):
+            for var, base, step_part in zip(vars_to_opt, base_values, step_parts):
+                delta = np.array(step_part.numpy(), dtype=np.float32)
+                var.assign((base + alpha * delta).astype(np.float32))
+
+            trial_loss = float(loss_fn().numpy())
+            if trial_loss <= current_loss + line_search_c * alpha * direction_dot:
+                accepted = True
+                break
+            alpha *= line_search_decay
+
+        if not accepted:
+            for var, base in zip(vars_to_opt, base_values):
+                var.assign(base.astype(np.float32))
+            del outer_tape
+            break
+
+        report["steps_run"] = int(step + 1)
+        report["cg_iters_last"] = int(cg_info["iters"])
+        report["line_search_alpha_last"] = float(alpha)
+        report["loss_after"] = float(trial_loss)
+
+        if verbose:
+            print(
+                f"  [SNOWS] {layer.name:20s} step={step+1}/{newton_steps}  "
+                f"loss={current_loss:.6f}->{trial_loss:.6f}  "
+                f"grad_norm={grad_norm:.4e}  cg_iters={cg_info['iters']}  alpha={alpha:.3f}"
+            )
+
+        del outer_tape
+
+    report["loss_after"] = float(loss_fn().numpy())
+    return report
+
+
+def snows_prune_to_ebops(
+    model,
+    teacher_model,
+    target_ebops: float,
+    sample_input,
+    init_method: str = "sensitivity",
+    b_floor: float = 0.30,
+    k_step: int = 2,
+    newton_steps: int = 2,
+    cg_max_iter: int = 25,
+    damping: float = 1e-4,
+    line_search_decay: float = 0.5,
+    line_search_c: float = 1e-4,
+    line_search_max_steps: int = 8,
+    verbose: bool = True,
+):
+    """SNOWS-style one-shot pruning for HGQ.
+
+    先用现有预算分配器生成低 EBOPs 初始点，再在固定 bit/mask 上以 K-step
+    深层表征重建目标，对每层做 Hessian-free Newton 更新。
+    """
+    if init_method not in {"sensitivity", "uniform", "spectral_quant"}:
+        raise ValueError(f"Unsupported SNOWS init_method: {init_method}")
+
+    current_ebops = compute_model_ebops(model, sample_input)
+    used_structured_low_budget = False
+    if verbose:
+        print(
+            f"[SNOWS] init_method={init_method}  current_ebops={current_ebops:.1f}  "
+            f"target_ebops={target_ebops:.1f}  k_step={k_step}"
+        )
+
+    if init_method == "sensitivity":
+        pruner = SensitivityAwarePruner(
+            target_ebops=float(target_ebops),
+            pruned_threshold=0.1,
+            b_k_min=max(float(b_floor), 0.20),
+        )
+        pruner.prune_to_ebops(model, current_ebops=current_ebops, verbose=verbose)
+    elif init_method == "uniform":
+        pruner = HighBitPruner(target_ebops=float(target_ebops), pruned_threshold=0.1)
+        pruner.prune_to_ebops(model, current_ebops=current_ebops, verbose=verbose)
+    else:
+        _, used_structured_low_budget = spectral_quant_prune_to_ebops(
+            model,
+            target_ebops=float(target_ebops),
+            sample_input=sample_input,
+            min_degree=2,
+            b_floor=b_floor,
+            low_budget_structured=True,
+            low_budget_threshold=900.0,
+            min_hidden_width=4,
+            near_budget_ratio=1.6,
+            high_budget_ratio=0.45,
+            verbose=verbose,
+        )
+
+    init_pruned_ebops = compute_model_ebops(model, sample_input)
+    dense_layers = _dense_prunable_layers(model)
+    layer_names = [layer.name for layer in dense_layers]
+    teacher_outputs = _collect_named_outputs(teacher_model, layer_names, sample_input, training=False)
+
+    reports = []
+    for idx, layer in enumerate(dense_layers):
+        horizon_names = layer_names[idx:min(len(layer_names), idx + max(1, int(k_step)) + 1)]
+        teacher_targets = [teacher_outputs[name] for name in horizon_names]
+        loss_fn = _snows_make_loss_fn(model, horizon_names, teacher_targets, sample_input)
+        before = float(loss_fn().numpy())
+        rep = _snows_optimize_layer(
+            model=model,
+            layer=layer,
+            loss_fn=loss_fn,
+            newton_steps=newton_steps,
+            cg_max_iter=cg_max_iter,
+            damping=damping,
+            line_search_decay=line_search_decay,
+            line_search_c=line_search_c,
+            line_search_max_steps=line_search_max_steps,
+            verbose=verbose,
+        )
+        rep["horizon"] = list(horizon_names)
+        rep["loss_before"] = before
+        rep["loss_after"] = float(loss_fn().numpy())
+        reports.append(rep)
+
+    final_ebops = compute_model_ebops(model, sample_input)
+    total_before = float(sum(float(r.get("loss_before", 0.0)) for r in reports))
+    total_after = float(sum(float(r.get("loss_after", 0.0)) for r in reports))
+    if verbose:
+        print(
+            f"[SNOWS] init_pruned_ebops={init_pruned_ebops:.1f}  final_ebops={final_ebops:.1f}  "
+            f"repr_loss_sum={total_before:.6f}->{total_after:.6f}"
+        )
+
+    return final_ebops, {
+        "init_method": init_method,
+        "k_step": int(k_step),
+        "newton_steps": int(newton_steps),
+        "cg_max_iter": int(cg_max_iter),
+        "damping": float(damping),
+        "used_structured_low_budget": bool(used_structured_low_budget),
+        "init_pruned_ebops": float(init_pruned_ebops),
+        "final_ebops": float(final_ebops),
+        "representation_loss_before_sum": total_before,
+        "representation_loss_after_sum": total_after,
+        "layers": reports,
+    }
 
 
 def teacher_guided_post_prune_calibration(
@@ -984,7 +1796,7 @@ def main():
                         default='results/baseline_copy/epoch=3699-val_acc=0.770-ebops=23293-val_loss=0.640.keras')
     parser.add_argument('--target_ebops', type=float, default=200.0)
     parser.add_argument('--prune_method', type=str, default='sensitivity',
-                        choices=['uniform', 'sensitivity', 'spectral_quant'])
+                        choices=['uniform', 'sensitivity', 'snip', 'grasp', 'synflow', 'spectral_quant', 'snows'])
     parser.add_argument('--input_h5', type=str, default='data/dataset.h5')
     parser.add_argument('--sample_size', type=int, default=512)
     parser.add_argument('--calibrate', action='store_true', default=True,
@@ -1015,6 +1827,17 @@ def main():
                         help='Enable structured low-budget pruning branch (default: enabled)')
     parser.add_argument('--no_low_budget_structured', action='store_true',
                         help='Disable structured low-budget pruning branch')
+    parser.add_argument('--snows_init_method', type=str, default='sensitivity',
+                        choices=['uniform', 'sensitivity', 'spectral_quant'],
+                        help='Initial budget allocation method used before SNOWS reconstruction')
+    parser.add_argument('--snows_k_step', type=int, default=2,
+                        help='SNOWS look-ahead horizon in prunable layers')
+    parser.add_argument('--snows_newton_steps', type=int, default=2,
+                        help='SNOWS Newton updates per layer')
+    parser.add_argument('--snows_cg_iters', type=int, default=25,
+                        help='Maximum conjugate-gradient iterations per SNOWS step')
+    parser.add_argument('--snows_damping', type=float, default=1e-4,
+                        help='Tikhonov damping used in SNOWS Hessian-free solves')
     args, _ = parser.parse_known_args()
     if args.no_calibrate:
         args.calibrate = False
@@ -1035,6 +1858,12 @@ def main():
         print(f'  low_budget_threshold : {args.low_budget_threshold}')
         print(f'  near_budget_ratio    : {args.near_budget_ratio}')
         print(f'  high_budget_ratio    : {args.high_budget_ratio}')
+    if args.prune_method == 'snows':
+        print(f'  snows_init_method    : {args.snows_init_method}')
+        print(f'  snows_k_step         : {args.snows_k_step}')
+        print(f'  snows_newton_steps   : {args.snows_newton_steps}')
+        print(f'  snows_cg_iters       : {args.snows_cg_iters}')
+        print(f'  snows_damping        : {args.snows_damping}')
     print('=' * 70)
 
     teacher_model = keras.models.load_model(args.checkpoint, compile=False)
@@ -1048,6 +1877,8 @@ def main():
     print(f'  Baseline EBOPs (measured): {baseline_ebops:.1f}')
 
     used_structured_low_budget = False
+    snows_report = None
+    saliency_report = None
 
     if args.prune_method == 'sensitivity':
         pruner = SensitivityAwarePruner(target_ebops=args.target_ebops, pruned_threshold=0.1, b_k_min=0.3)
@@ -1055,6 +1886,32 @@ def main():
     elif args.prune_method == 'uniform':
         pruner = HighBitPruner(target_ebops=args.target_ebops, pruned_threshold=0.1)
         pruner.prune_to_ebops(model, current_ebops=baseline_ebops, verbose=True)
+    elif args.prune_method in {'snip', 'grasp', 'synflow'}:
+        _, saliency_report = saliency_prune_to_ebops(
+            model,
+            target_ebops=args.target_ebops,
+            sample_input=sample_input,
+            method=args.prune_method,
+            input_h5=args.input_h5,
+            sample_size=args.sample_size,
+            b_floor=args.b_floor,
+            verbose=True,
+        )
+    elif args.prune_method == 'snows':
+        _, snows_report = snows_prune_to_ebops(
+            model,
+            teacher_model=teacher_model,
+            target_ebops=args.target_ebops,
+            sample_input=sample_input,
+            init_method=args.snows_init_method,
+            b_floor=args.b_floor,
+            k_step=args.snows_k_step,
+            newton_steps=args.snows_newton_steps,
+            cg_max_iter=args.snows_cg_iters,
+            damping=args.snows_damping,
+            verbose=True,
+        )
+        used_structured_low_budget = bool(snows_report.get('used_structured_low_budget', False))
     else:
         _, used_structured_low_budget = spectral_quant_prune_to_ebops(
             model,
@@ -1072,6 +1929,12 @@ def main():
 
     post_prune_ebops = compute_model_ebops(model, sample_input)
     print(f'  Post-prune EBOPs (measured): {post_prune_ebops:.1f}')
+    if saliency_report is not None:
+        print(
+            f"  [{args.prune_method.upper()}] kept="
+            f"{saliency_report['kept_connections']}/{saliency_report['total_active_connections']}  "
+            f"pre_bisect_ebops={saliency_report['pre_bisect_ebops']:.1f}"
+        )
 
     post_func_calib_ebops = post_prune_ebops
     if args.functional_calibrate:
@@ -1143,6 +2006,8 @@ def main():
         'calibrated': bool(args.calibrate),
         'functional_calibrated': bool(args.functional_calibrate),
         'functional_passes': int(args.functional_passes),
+        'saliency_report': saliency_report,
+        'snows_report': snows_report,
         'weights_path': str(weights_path),
     }
     meta_path = weights_path.with_suffix('.meta.json')
