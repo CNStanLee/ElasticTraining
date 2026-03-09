@@ -1871,6 +1871,436 @@ def spectral_quant_prune_to_ebops(
     return measured, False
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# SpectralSynFlow (SSF)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _ssf_repair_rank(
+    mask: np.ndarray,
+    s_abs: np.ndarray,
+    kernel_2d: np.ndarray,
+    min_rank: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Greedily increase matrix_rank(kernel_2d * mask) to at least min_rank.
+
+    Crucially uses the **actual weight matrix** (not the binary mask) for rank
+    checks, so that adding edges at dead (near-zero) kernel positions is handled
+    correctly by reinitialising those weights from the layer's active distribution.
+
+    Returns (repaired_mask, repaired_kernel_2d).
+    """
+    in_dim, out_dim = mask.shape
+    min_rank = int(np.clip(min_rank, 1, min(in_dim, out_dim)))
+    kernel_2d = kernel_2d.copy()
+
+    # Robust weight scale: use ALL kernel values (before masking) so that even
+    # after heavy pruning the resampled weights are in a meaningful range.
+    all_w = np.abs(kernel_2d.ravel())
+    all_w_nz = all_w[all_w > 1e-8]
+    w_scale = float(np.std(all_w_nz)) if all_w_nz.size > 1 else float(np.mean(all_w) + 1e-4)
+    w_scale = max(w_scale, 0.01)
+
+    def _eff_rank(m, k):
+        return int(np.linalg.matrix_rank((k * m).astype(np.float64)))
+
+    if _eff_rank(mask, kernel_2d) >= min_rank:
+        return mask, kernel_2d
+
+    mask = mask.copy()
+
+    # Stage 1: unique-primary assignment — give each output column a distinct
+    # pivot row so that no two columns are guaranteed colinear.
+    claimed: set[int] = set()
+    for o in np.argsort(-s_abs.sum(axis=0)):          # strongest columns first
+        o = int(o)
+        current_rows = np.flatnonzero(mask[:, o] > 0.5)
+        # Find rows already in mask for this column that aren't claimed elsewhere
+        unique = [r for r in current_rows.tolist() if r not in claimed]
+        if unique:
+            # Among claimed rows, pick the one with largest |weight|
+            pivot = unique[int(np.argmax(np.abs(kernel_2d[unique, o])))]
+        else:
+            # Find the best available row not yet claimed
+            avail = [r for r in range(in_dim) if r not in claimed]
+            if not avail:
+                avail = list(range(in_dim))
+            pivot = avail[int(np.argmax(s_abs[avail, o]))]
+            if mask[pivot, o] < 0.5:
+                mask[pivot, o] = 1.0
+                # Reinitialise dead weight
+                if abs(float(kernel_2d[pivot, o])) < 1e-6:
+                    sign = 1 if s_abs[pivot, o] >= float(s_abs[:, o].mean()) else -1
+                    kernel_2d[pivot, o] = float(sign * w_scale * 0.5)
+        claimed.add(pivot)
+
+    # Stage 2: score-guided greedy rank repair on effective weight matrix
+    for _ in range(min_rank * out_dim * 2):
+        cur_rank = _eff_rank(mask, kernel_2d)
+        if cur_rank >= min_rank:
+            break
+        # Gather non-selected (i, o) with nonzero actual weight, sorted by SSF score
+        candidates = []
+        for o in range(out_dim):
+            for i in np.flatnonzero(mask[:, o] < 0.5):
+                candidates.append((float(s_abs[i, o]), float(abs(kernel_2d[i, o])), int(i), int(o)))
+        if not candidates:
+            break
+        # Prefer: high score AND non-zero weight; sort: (w_nonzero, score) descending
+        candidates.sort(key=lambda x: (float(x[1] > 1e-6), x[0]), reverse=True)
+        improved = False
+        for _, w_val, i, o in candidates:
+            test_mask = mask.copy()
+            test_k = kernel_2d.copy()
+            test_mask[i, o] = 1.0
+            if abs(w_val) < 1e-6:
+                # Reinitialise dead weight before checking rank
+                sign = 1 if s_abs[i, o] >= float(s_abs[:, o].mean()) else -1
+                test_k[i, o] = float(sign * w_scale * 0.5)
+            if _eff_rank(test_mask, test_k) > cur_rank:
+                mask[i, o] = 1.0
+                kernel_2d[i, o] = float(test_k[i, o])
+                improved = True
+                break
+        if not improved:
+            break
+
+    return mask, kernel_2d
+
+
+def spectral_synflow_prune_to_ebops(
+    model,
+    target_ebops: float,
+    sample_input,
+    n_iters: int = 5,
+    min_degree: int = 2,
+    min_rank: int = 2,
+    uniform_mix: float = 0.35,
+    b_floor: float = 1.0,
+    b_ceiling: float = 6.0,
+    score_power: float = 0.5,
+    verbose: bool = True,
+) -> tuple[float, dict]:
+    """SpectralSynFlow (SSF) — improved iterative data-free pruning.
+
+    Key improvements over spectral_quant_prune_to_ebops
+    ───────────────────────────────────────────────────
+    1. **No eBOPs-stage branching** — single unified code path for all budgets.
+    2. **SynFlow data-free scores** — avoids layer-collapse by propagating
+       gradient through a linearised absolute network (ones input).
+    3. **Geometric annealing** — n_iters passes: B_t = B_T×(cur/B_T)^((T−t)/T).
+    4. **Score-guided bit-width** — b ∝ saliency^α per connection.
+    5. **Mixed budget allocation** — (1−uniform_mix)×score_frac + uniform_mix×(1/L)
+       prevents small-score layers (e.g. output) from being budget-starved.
+    6. **Rank-guarantee repair** — after each top-k pass, greedily enforce
+       matrix_rank(mask_l) ≥ min_rank via unique-pivot assignment + edge insertion,
+       eliminating the rank-collapse that caused IBR=0.5 at low budgets.
+
+    Parameters
+    ----------
+    model        : Keras model with HGQ quantised layers.
+    target_ebops : Desired eBOPs budget after pruning.
+    sample_input : Representative tensor for eBOPs measurement.
+    n_iters      : Annealing iterations (default 5).
+    min_degree   : Minimum per-column (per-output-neuron) degree (default 2).
+    min_rank     : Minimum matrix rank enforced per layer (default 2).
+    uniform_mix  : Weight of uniform-floor in budget allocation ∈ [0,1]
+                   (default 0.35 — prevents output-layer starvation).
+    b_floor      : Minimum kernel quantiser bit-width (default 1.0).  ≥1 required
+                   so that round_conv(b_floor) ≥ 1 → HGQ treats the connection as live.
+    b_ceiling    : Maximum kernel quantiser bit-width (default 6.0).
+    score_power  : Exponent for saliency→bit-width: b ∝ score^α (default 0.5).
+    verbose      : Print per-iteration diagnostics.
+
+    Returns
+    -------
+    (final_measured_ebops, report_dict)
+    """
+    current_ebops = compute_model_ebops(model, sample_input)
+    dense_layers = _dense_prunable_layers(model)
+    if not dense_layers:
+        return current_ebops, {"status": "no_prunable_layers"}
+
+    target_ebops = float(target_ebops)
+    report: dict = {
+        "method": "spectral_synflow",
+        "target_ebops": target_ebops,
+        "initial_ebops": float(current_ebops),
+        "n_iters": n_iters,
+        "iterations": [],
+    }
+
+    if current_ebops <= target_ebops * 1.05:
+        if verbose:
+            print(f"[SSF] near-budget, skip: current={current_ebops:.1f} ≤ target×1.05={target_ebops*1.05:.1f}")
+        report["status"] = "near_budget_skip"
+        report["final_ebops"] = float(current_ebops)
+        return float(current_ebops), report
+
+    # ── helper: one SynFlow evaluation ─────────────────────────────────────
+    def _ssf_scores() -> dict[str, np.ndarray]:
+        """Compute |W| ⊙ |∂R/∂W| on absolute network with ones-input."""
+        backups = []
+        for layer in _flatten_layers(model):
+            for attr in ("kernel", "bias"):
+                var = getattr(layer, attr, None)
+                if var is None:
+                    continue
+                arr = np.array(var.numpy(), dtype=np.float32)
+                backups.append((var, arr))
+                var.assign(np.abs(arr))
+        try:
+            ones = tf.ones_like(sample_input)
+            params = [lyr.kernel for lyr in dense_layers]
+            with tf.GradientTape() as tape:
+                logits = model(ones, training=False)
+                R = tf.reduce_sum(logits)
+            grads = tape.gradient(R, params)
+            scores: dict[str, np.ndarray] = {}
+            for lyr, g in zip(dense_layers, grads):
+                g_np = (np.zeros(tuple(lyr.kernel.shape), dtype=np.float32)
+                        if g is None else np.array(g.numpy(), dtype=np.float32))
+                w_np = np.abs(np.array(lyr.kernel.numpy(), dtype=np.float32))
+                scores[lyr.name] = (w_np * np.abs(g_np)).astype(np.float32)
+        finally:
+            for var, arr in backups:
+                var.assign(arr)
+        return scores
+
+    # ── helper: apply masks for one annealing step ──────────────────────────
+    def _apply_ssf_step(scores: dict[str, np.ndarray], budget_t: float):
+        """Allocate degree per layer via score-weighted budget; rebuild masks."""
+        # Layer-level score totals for budget allocation
+        layer_score_sum: dict[str, float] = {}
+        for lyr in dense_layers:
+            s = scores.get(lyr.name, np.zeros(lyr.kernel.shape, dtype=np.float32))
+            layer_score_sum[lyr.name] = float(np.sum(s)) + 1e-30
+
+        total_score = sum(layer_score_sum.values())
+
+        # Estimate current mean bit-width per active connection in each layer
+        # (used as cost proxy: eBOPs ≈ Σ_conn  b_k × b_a)
+        layer_bk_mean: dict[str, float] = {}
+        for lyr in dense_layers:
+            kq = getattr(lyr, "kq", None)
+            if kq is not None:
+                bv = _get_kq_var(kq, "b")
+                if bv is None:
+                    bv = _get_kq_var(kq, "f")
+                if bv is not None:
+                    b_np = np.array(bv.numpy(), dtype=np.float32)
+                    # Only count connections that survive round_conv (b ≥ 0.5 → ≥1 bit)
+                    live = b_np[b_np >= 0.5]
+                    layer_bk_mean[lyr.name] = float(np.mean(np.ceil(live))) if live.size else b_floor
+                else:
+                    layer_bk_mean[lyr.name] = b_floor
+            else:
+                layer_bk_mean[lyr.name] = b_floor
+
+        for lyr in dense_layers:
+            kernel = np.array(lyr.kernel.numpy(), dtype=np.float32)
+            if kernel.ndim != 2:
+                continue
+            in_dim, out_dim = kernel.shape
+            s = scores.get(lyr.name, np.zeros_like(kernel)).astype(np.float32)
+            s_abs = np.abs(s) + 1e-30
+
+            # ── Spectral degree allocation ─────────────────────────────────
+            # Mixed budget allocation: uniform_mix prevents small-score layers
+            # (e.g. output) from being budget-starved.
+            score_frac = layer_score_sum[lyr.name] / total_score
+            mixed_frac = ((1.0 - uniform_mix) * score_frac
+                          + uniform_mix / max(len(dense_layers), 1))
+            cost_proxy = max(layer_bk_mean[lyr.name] ** 2, 1.0)  # b_k*b_a approx (b≥1 now)
+            target_conn = max(
+                int(out_dim * min_degree),
+                int(round(mixed_frac * budget_t / cost_proxy)),
+            )
+            target_conn = int(np.clip(target_conn, out_dim * min_degree, in_dim * out_dim))
+            d = int(np.clip(round(target_conn / max(out_dim, 1)), min_degree, in_dim))
+
+            # ── Top-k mask guided by SynFlow scores ───────────────────────
+            mask = np.zeros((in_dim, out_dim), dtype=np.float32)
+            top_k = min(d, in_dim)
+            for o in range(out_dim):
+                idx = np.argpartition(s_abs[:, o], -top_k)[-top_k:]
+                mask[idx, o] = 1.0
+
+            # Repair isolated input nodes (connectivity preservation)
+            row_deg = mask.sum(axis=1)
+            for i in np.where(row_deg == 0)[0]:
+                o = int(np.argmax(s_abs[i, :]))
+                active_rows = np.where(mask[:, o] > 0.5)[0]
+                if active_rows.size == 0:
+                    mask[i, o] = 1.0
+                else:
+                    weakest = active_rows[np.argmin(s_abs[active_rows, o])]
+                    mask[weakest, o] = 0.0
+                    mask[i, o] = 1.0
+
+            # ── Rank-guarantee repair ─────────────────────────────────────
+            # Ensures matrix_rank(kernel*mask) ≥ min(min_rank, in_dim, out_dim)
+            # Uses actual weight values for rank check; reinitialises dead weights
+            # at newly-added edge positions so structural_rank is truly satisfied.
+            layer_min_rank = int(np.clip(min_rank, 1, min(in_dim, out_dim)))
+            mask, kernel = _ssf_repair_rank(mask, s_abs, kernel, layer_min_rank)
+
+            lyr.kernel.assign((kernel * mask).astype(np.float32))
+
+            # ── Score-proportional bit-width assignment ────────────────────
+            kq = getattr(lyr, "kq", None)
+            if kq is not None:
+                b_var = _get_kq_var(kq, "b")
+                if b_var is None:
+                    b_var = _get_kq_var(kq, "f")
+                i_var = _get_kq_var(kq, "i")
+                k_var = _get_kq_var(kq, "k")
+
+                if b_var is not None:
+                    b_old = np.array(b_var.numpy(), dtype=np.float32)
+                    # Normalise per-layer saliency to [0, 1] using L∞
+                    s_max = float(s_abs.max()) + 1e-12
+                    s_norm = (s_abs / s_max).astype(np.float32)  # in [0, 1]
+                    # Active connections: b = blend(b_floor, b_ceiling) weighted by score^α
+                    b_target_active = (
+                        b_floor + (b_ceiling - b_floor) * (s_norm ** score_power)
+                    ).astype(np.float32)
+                    # Preserve any larger existing b, but cap at b_ceiling
+                    b_active = np.clip(
+                        np.maximum(b_old, b_floor).astype(np.float32) * 0.2
+                        + b_target_active * 0.8,
+                        b_floor, b_ceiling,
+                    )
+                    b_new = np.where(mask > 0.5, b_active, 0.0).astype(np.float32)
+                    b_var.assign(b_new)
+
+                if i_var is not None:
+                    i_old = np.array(i_var.numpy(), dtype=np.float32)
+                    i_new = np.where(mask > 0.5,
+                                     np.clip(i_old, -2.0, 6.0),
+                                     -16.0).astype(np.float32)
+                    i_var.assign(i_new)
+
+                if k_var is not None:
+                    k_var.assign(np.where(mask > 0.5, 1.0, 0.0).astype(np.float32))
+
+            # ── Bias quantizer ─────────────────────────────────────────────
+            bq = getattr(lyr, "bq", None)
+            if bq is not None:
+                cols_active = mask.sum(axis=0) > 0
+                bb_var = _get_kq_var(bq, "b")
+                if bb_var is None:
+                    bb_var = _get_kq_var(bq, "f")
+                bi_var = _get_kq_var(bq, "i")
+                bk_var = _get_kq_var(bq, "k")
+                if bb_var is not None:
+                    bb_old = np.array(bb_var.numpy(), dtype=np.float32)
+                    bb_new = np.where(
+                        cols_active,
+                        np.clip(np.maximum(bb_old, b_floor), b_floor, b_ceiling),
+                        0.0,
+                    ).astype(np.float32)
+                    bb_var.assign(bb_new)
+                if bi_var is not None:
+                    bi_old = np.array(bi_var.numpy(), dtype=np.float32)
+                    bi_new = np.where(cols_active,
+                                      np.clip(bi_old, -2.0, 6.0),
+                                      -16.0).astype(np.float32)
+                    bi_var.assign(bi_new)
+                if bk_var is not None:
+                    bk_var.assign(np.where(cols_active, 1.0, 0.0).astype(np.float32))
+
+            if verbose:
+                col_deg = mask.sum(axis=0)
+                row_deg = mask.sum(axis=1)
+                rank_actual = int(np.linalg.matrix_rank((kernel * mask).astype(np.float64)))
+                print(
+                    f"  [SSF]   {lyr.name:20s}  d={d:3d}  "
+                    f"active={int(mask.sum()):>5}/{in_dim*out_dim}  "
+                    f"rank={rank_actual}/{layer_min_rank}  "
+                    f"deg_col_mean={float(col_deg.mean()):.2f}  "
+                    f"isolated_rows={int((row_deg==0).sum())}"
+                )
+
+    # ── Iterative annealed pruning loop ─────────────────────────────────────
+    for t in range(1, n_iters + 1):
+        cur = compute_model_ebops(model, sample_input)
+        if cur <= target_ebops:
+            if verbose:
+                print(f"[SSF] iter={t}: budget reached early "
+                      f"({cur:.1f} ≤ {target_ebops:.1f}), stopping.")
+            break
+
+        # Geometric annealing schedule:
+        #   B_t = B_T × (cur / B_T)^((n_iters - t) / n_iters)
+        #   → B_1 ≈ cur (mild),  B_{n_iters} = B_T (exact target)
+        exponent = (n_iters - t) / n_iters
+        budget_t = float(
+            np.clip(target_ebops * ((cur / target_ebops) ** exponent),
+                    target_ebops, cur)
+        )
+
+        if verbose:
+            print(f"\n[SSF] ── iter {t}/{n_iters}  "
+                  f"cur={cur:.1f}  budget_t={budget_t:.1f}  target={target_ebops:.1f}")
+
+        scores = _ssf_scores()
+        _apply_ssf_step(scores, budget_t)
+
+        measured = compute_model_ebops(model, sample_input)
+        report["iterations"].append({
+            "iter": t,
+            "budget_t": float(budget_t),
+            "pre_ebops": float(cur),
+            "post_ebops": float(measured),
+        })
+        if verbose:
+            print(f"[SSF] iter={t} done:  post_ebops={measured:.1f}")
+
+    final_ebops = compute_model_ebops(model, sample_input)
+    report["final_ebops"] = float(final_ebops)
+    report["status"] = "done"
+    if verbose:
+        print(f"[SSF] finished  final_ebops={final_ebops:.1f}  "
+              f"target={target_ebops:.1f}  iters={len(report['iterations'])}")
+    return float(final_ebops), report
+
+
+def snap_active_bk(model, snap_min: float = 1.0) -> int:
+    """消除 limbo 区：把 _b ∈ (0, snap_min) 的活跃连接强制提升到 snap_min。
+
+    问题根源
+    ────────
+    bisect_ebops_to_target 通过全局缩放 bk 来命中目标 eBOPs，
+    可能把某些 _b 压到 (0, 0.5) 区间。
+    round_conv(_b < 0.5) = 0 → 训练开始时这些连接立即死亡
+    → eBOPs 骤降、层崩溃。
+
+    本函数应在 bisect_ebops_to_target 之后（对 spectral 类算法）调用，
+    确保所有"结构上活跃"的连接都以至少 snap_min bits 开始训练。
+
+    Returns
+    -------
+    snapped : int
+        被提升的连接数。
+    """
+    n_snapped = 0
+    for layer in _flatten_layers(model):
+        kq = getattr(layer, 'kq', None)
+        if kq is None:
+            continue
+        b_var = _get_kq_var(kq, 'b')
+        if b_var is None:
+            b_var = _get_kq_var(kq, 'f')
+        if b_var is None:
+            continue
+        b = b_var.numpy()
+        limbo = (b > 0.0) & (b < float(snap_min))
+        if limbo.any():
+            b_var.assign(np.where(limbo, float(snap_min), b).astype(np.float32))
+            n_snapped += int(limbo.sum())
+    return n_snapped
+
+
 def bisect_ebops_to_target(
     model,
     target_ebops,

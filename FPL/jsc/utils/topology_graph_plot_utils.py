@@ -78,6 +78,17 @@ class TopologyGraphPlotter:
 
         return self._broadcast_like(bits, kernel_shape)
 
+    def _extract_raw_b(self, layer, kernel_shape: tuple[int, ...]) -> np.ndarray:
+        """Return raw (pre-round_conv) _b parameter values as float32."""
+        b_var = _get_kq_var(layer.kq, "b")
+        if b_var is None:
+            b_var = _get_kq_var(layer.kq, "f")
+        if b_var is not None:
+            raw = np.array(b_var.numpy(), dtype=np.float32)
+            return self._broadcast_like(raw, kernel_shape)
+        # fallback: use bits_() as float
+        return self._extract_bits(layer, kernel_shape)
+
     @staticmethod
     def _to_symmetric_matrix(m: np.ndarray) -> np.ndarray:
         m_lr = np.concatenate([np.fliplr(m), m], axis=1)
@@ -99,7 +110,7 @@ class TopologyGraphPlotter:
             if kernel.ndim < 2:
                 continue
 
-            bits = self._extract_bits(layer, kernel.shape)
+            bits = self._extract_raw_b(layer, kernel.shape)
             k2 = self._to_2d(kernel)
             b2 = self._to_2d(bits)
             if b2.shape != k2.shape:
@@ -126,9 +137,9 @@ class TopologyGraphPlotter:
         if not layers:
             raise RuntimeError("No quantized kernel layers found in model.")
 
-        values = [x.weighted_matrix[x.weighted_matrix > 0] for x in layers]
-        values = [v for v in values if v.size > 0]
-        vmax = float(np.percentile(np.concatenate(values), 99.0)) if values else 1.0
+        all_vals = [x.bit_matrix[x.bit_matrix > 0] for x in layers]
+        all_vals = [v for v in all_vals if v.size > 0]
+        vmax = float(np.percentile(np.concatenate(all_vals), 99.0)) if all_vals else 8.0
         vmax = max(vmax, 1e-8)
 
         n = len(layers)
@@ -137,7 +148,7 @@ class TopologyGraphPlotter:
         im = None
         for i, item in enumerate(layers):
             ax = axes[i]
-            m = item.weighted_matrix
+            m = item.bit_matrix
             if self.symmetric_topology_plot:
                 m = self._to_symmetric_matrix(m)
             im = ax.imshow(m, aspect="auto", vmin=0.0, vmax=vmax, cmap="viridis")
@@ -146,7 +157,7 @@ class TopologyGraphPlotter:
             ax.set_ylabel("in")
 
         cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.88, pad=0.02)
-        cbar.set_label("Edge score (bit * |weight|)")
+        cbar.set_label("_b (raw, pre-round)")
         title_text = title or (
             "Weighted Topology Connectivity Matrices"
             + (" (symmetric view)" if self.symmetric_topology_plot else "")
@@ -170,13 +181,13 @@ class TopologyGraphPlotter:
         if not layers:
             raise RuntimeError("No quantized kernel layers found in model.")
 
-        layer_sizes = [layers[0].weighted_matrix.shape[0]] + [x.weighted_matrix.shape[1] for x in layers]
+        layer_sizes = [layers[0].bit_matrix.shape[0]] + [x.bit_matrix.shape[1] for x in layers]
         x_pos = np.arange(len(layer_sizes), dtype=np.float32)
         y_pos = [self._symmetric_y_positions(n) for n in layer_sizes]
 
-        values = [x.weighted_matrix[x.weighted_matrix > 0] for x in layers]
-        values = [v for v in values if v.size > 0]
-        vmax = float(np.percentile(np.concatenate(values), 99.0)) if values else 1.0
+        all_vals = [x.bit_matrix[x.bit_matrix > 0] for x in layers]
+        all_vals = [v for v in all_vals if v.size > 0]
+        vmax = float(np.percentile(np.concatenate(all_vals), 99.0)) if all_vals else 8.0
         vmax = max(vmax, 1e-8)
 
         fig, ax = plt.subplots(figsize=(12, 7))
@@ -185,24 +196,26 @@ class TopologyGraphPlotter:
 
         total_edges = 0
         for li, item in enumerate(layers):
-            mat = item.weighted_matrix
+            mat = item.bit_matrix
             ys = y_pos[li]
             yt = y_pos[li + 1]
-            src, dst = np.where(mat > 1e-8)
+            src, dst = np.where(mat > 0)
             total_edges += int(src.size)
 
             for i, j in zip(src, dst):
-                score = float(mat[i, j])
-                intensity = min(score / vmax, 1.0)
+                bits_val = float(mat[i, j])
+                intensity = min(bits_val / vmax, 1.0)
                 linewidth = 0.5 + 1.6 * intensity
                 alpha = 0.35 + 0.45 * intensity
-                color = cmap(norm(score))
+                color = cmap(norm(bits_val))
+                linestyle = "--" if bits_val < 0.4 else "-"
                 ax.plot(
                     [x_pos[li], x_pos[li + 1]],
                     [ys[i], yt[j]],
                     color=color,
                     linewidth=linewidth,
                     alpha=alpha,
+                    linestyle=linestyle,
                 )
                 if self.mirror_edges and (abs(float(ys[i])) > 1e-9 or abs(float(yt[j])) > 1e-9):
                     ax.plot(
@@ -211,6 +224,7 @@ class TopologyGraphPlotter:
                         color=color,
                         linewidth=linewidth,
                         alpha=alpha,
+                        linestyle=linestyle,
                     )
 
         for li, n in enumerate(layer_sizes):
@@ -232,7 +246,7 @@ class TopologyGraphPlotter:
         sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
         sm.set_array([])
         cbar = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
-        cbar.set_label("Edge score (bit * |weight|)")
+        cbar.set_label("_b (raw, pre-round)")
 
         ax.set_xlim(-0.4, x_pos[-1] + 0.4)
         ax.set_ylim(-1.08, 1.18)
@@ -240,7 +254,7 @@ class TopologyGraphPlotter:
         ax.set_yticks([])
         ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8, alpha=0.4)
         title_text = title or (
-            f"Weighted Circle Connection Graph (active edges={total_edges})"
+            f"Circle Connection Graph — colored by _b (raw) (active edges={total_edges})"
             + (" (mirror view)" if self.mirror_edges else "")
         )
         if subtitle:

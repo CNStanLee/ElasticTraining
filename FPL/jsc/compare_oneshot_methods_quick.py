@@ -67,11 +67,15 @@ from compare_spectral_vs_natural_topology_v2 import (
     LayerMetrics,
     K_CLASSES,
     _print_metrics,
+    find_best_baseline_ckpt,
 )
+from utils.topology_graph_plot_utils import TopologyGraphPlotter
 from run_one_shot_prune_only import (
     compute_model_ebops,
     bisect_ebops_to_target,
+    snap_active_bk,
     spectral_quant_prune_to_ebops,
+    spectral_synflow_prune_to_ebops,
     saliency_prune_to_ebops,
     snows_prune_to_ebops,
     build_sample_input,
@@ -89,7 +93,7 @@ tf.random.set_seed(42)
 # 配置
 # ══════════════════════════════════════════════════════════════════════════════
 
-BASELINE_CKPT = "results/baseline/epoch=7789-val_acc=0.770-ebops=19899-val_loss=0.641.keras"
+BASELINE_CKPT = "results/baseline/epoch=2236-val_acc=0.770-ebops=23589-val_loss=0.641.keras"
 INPUT_H5 = "data/dataset.h5"
 
 TARGET_EBOPS_LIST = [400, 1000, 1500, 2500, 6800]
@@ -102,18 +106,25 @@ METHODS = [
     'grasp',             # 4. GraSP (梯度信号保持)
     'synflow',           # 5. SynFlow (数据无关)
     'spectral_quant',    # 6. 谱/拓扑友好剪枝
-    'snows',             # 7. SNOWS (二阶表征重建)
+    'spectral_synflow',  # 7. SpectralSynFlow — SynFlow 分数 × 谱拓扑约束 (本项目)
+    'snows',             # 8. SNOWS (二阶表征重建)
+    'progressive_pruning',  # 9. 渐进剪枝基线 (已训练检查点)
 ]
+
+# 渐进剪枝基线检查点目录 (同一次渐进训练轨迹的快照)
+PROGRESSIVE_PRUNING_DIR = Path("results/baseline")
 
 # 方法显示名称
 METHOD_LABELS = {
-    'uniform':        'Magnitude (Uniform)',
-    'sensitivity':    'Sensitivity',
-    'snip':           'SNIP',
-    'grasp':          'GraSP',
-    'synflow':        'SynFlow',
-    'spectral_quant': 'Spectral-Quant',
-    'snows':          'SNOWS',
+    'uniform':              'Magnitude (Uniform)',
+    'sensitivity':          'Sensitivity',
+    'snip':                 'SNIP',
+    'grasp':                'GraSP',
+    'synflow':              'SynFlow',
+    'spectral_quant':       'Spectral-Quant',
+    'spectral_synflow':     'SpectralSynFlow',
+    'snows':                'SNOWS',
+    'progressive_pruning':  '渐进剪枝 (Baseline)',
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -126,13 +137,13 @@ parser.add_argument('--checkpoint', type=str, default=BASELINE_CKPT,
 parser.add_argument('--targets', type=float, nargs='+', default=TARGET_EBOPS_LIST,
                     help='List of target eBOPs budgets')
 parser.add_argument('--methods', type=str, nargs='+', default=METHODS,
-                    choices=METHODS + ['all'],
-                    help='Methods to compare')
+                    choices=list(METHODS) + ['all'],
+                    help='Methods to compare (use "all" for all methods)')
 parser.add_argument('--output_dir', type=str, default='results/oneshot_methods_comparison',
                     help='Output directory')
 parser.add_argument('--input_h5', type=str, default=INPUT_H5)
 parser.add_argument('--sample_size', type=int, default=512)
-parser.add_argument('--no_plot', action='store_true', help='Skip topology plots')
+parser.add_argument('--no_plot', action=argparse.BooleanOptionalAction, default=False, help='Skip topology plots (--no_plot to skip, --no-no_plot or omit to enable)')
 parser.add_argument('--no_calibrate', action='store_true',
                     help='Skip bisection calibration after pruning')
 args, _ = parser.parse_known_args()
@@ -157,6 +168,35 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 辅助工具
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _find_progressive_ckpt(
+    target_ebops: float,
+) -> tuple[Path, int, float] | None:
+    """从 results/baseline/ 中找 eBOPs 最接近 target_ebops 的渐进剪枝检查点。
+
+    直接按 |e - target| 排序，精度作为次优先，不区分 above/below。
+    """
+    if not PROGRESSIVE_PRUNING_DIR.exists():
+        return None
+    candidates: list[tuple[Path, int, float]] = []
+    for p in PROGRESSIVE_PRUNING_DIR.glob("*.keras"):
+        import re as _re
+        m_e = _re.search(r'ebops=(\d+)', p.name)
+        m_a = _re.search(r'val_acc=([0-9.]+)', p.name)
+        if m_e is None:
+            continue
+        e = int(m_e.group(1))
+        a = float(m_a.group(1)) if m_a else 0.0
+        candidates.append((p, e, a))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (abs(x[1] - target_ebops), -x[2]))
+    return candidates[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -197,6 +237,18 @@ def prune_model(method: str, model, target_ebops: float,
         )
         info['used_structured'] = used_structured
 
+    elif method == 'spectral_synflow':
+        _, ssf_report = spectral_synflow_prune_to_ebops(
+            model, target_ebops=target_ebops,
+            sample_input=sample_input,
+            n_iters=5, min_degree=2,
+            min_rank=2, uniform_mix=0.35,
+            b_floor=1.0, b_ceiling=6.0,
+            score_power=0.5,
+            verbose=True,
+        )
+        info['ssf_report'] = ssf_report
+
     elif method == 'snows':
         if teacher_model is None:
             raise ValueError("SNOWS requires a teacher model")
@@ -209,6 +261,10 @@ def prune_model(method: str, model, target_ebops: float,
             verbose=True,
         )
         info['snows_report'] = snows_report
+
+    elif method == 'progressive_pruning':
+        # 由主循环直接加载检查点, 此分支不应被调用
+        pass
 
     else:
         raise ValueError(f"Unknown method: {method}")
@@ -223,6 +279,13 @@ def prune_model(method: str, model, target_ebops: float,
             allow_connection_kill=not preserve,
         )
         info['calibrated_ebops'] = calibrated
+        # snap limbo connections (_b ∈ (0,1)) → 1.0 for spectral methods
+        if method in ('spectral_quant', 'spectral_synflow'):
+            n_snapped = snap_active_bk(model, snap_min=1.0)
+            if n_snapped > 0:
+                recal = compute_model_ebops(model, sample_input)
+                info['calibrated_ebops'] = recal
+                logger.info(f'  [snap_active_bk] snapped {n_snapped} limbo → 1-bit, post-snap eBOPs={recal:.1f}')
 
     info['final_ebops'] = compute_model_ebops(model, sample_input)
     return info
@@ -632,6 +695,14 @@ def main():
 
     # ── 逐预算逐方法执行 ─────────────────────────────────────────────────
     all_metrics: list[ModelMetrics] = []
+    # ── 拓扑绘图器 (圆形拓扑图, 不生成矩阵图) ──────────────────────────────
+    _topo_plotter = TopologyGraphPlotter(
+        symmetric_topology_plot=False,
+        mirror_edges=False,
+        plot_matrix=False,
+        strict_original_connections=True,
+    )
+
     total_experiments = len(args.targets) * len(args.methods)
     exp_count = 0
 
@@ -647,19 +718,40 @@ def main():
             logger.info(f"  {'─'*60}")
 
             try:
-                # 每次从头加载模型，确保独立性
-                model = keras.models.load_model(args.checkpoint, compile=False)
-
-                # 执行剪枝
-                prune_info = prune_model(
-                    method, model, float(target_ebops),
-                    sample_input, teacher_model=teacher_model,
-                )
+                # ── 加载模型 ───────────────────────────────────────────
+                if method == 'progressive_pruning':
+                    prog = _find_progressive_ckpt(target_ebops)
+                    if prog is None:
+                        logger.warning(
+                            f"  跳过 progressive_pruning@{int(target_ebops)}: "
+                            f"无匹配检查点"
+                        )
+                        continue
+                    ckpt_path, ckpt_e, ckpt_a = prog
+                    logger.info(
+                        f"  渐进剪枝检查点: {ckpt_path.name}  "
+                        f"(ebops={ckpt_e}, acc={ckpt_a:.4f})"
+                    )
+                    model = keras.models.load_model(
+                        str(ckpt_path), compile=False
+                    )
+                    prune_info = {
+                        'method': method, 'target_ebops': target_ebops,
+                        'ckpt_path': str(ckpt_path), 'ckpt_ebops': ckpt_e,
+                    }
+                else:
+                    # 每次从头加载模型，确保独立性
+                    model = keras.models.load_model(args.checkpoint, compile=False)
+                    # 执行剪枝
+                    prune_info = prune_model(
+                        method, model, float(target_ebops),
+                        sample_input, teacher_model=teacher_model,
+                    )
 
                 # 分析拓扑指标
                 metrics = analyze_model(
                     model, sample_input, method, int(target_ebops),
-                    source_path=args.checkpoint,
+                    source_path=prune_info.get('ckpt_path', args.checkpoint),
                     x_val=x_eval, y_val=y_eval,
                 )
                 all_metrics.append(metrics)
@@ -672,6 +764,32 @@ def main():
                     f"PRI={metrics.PRI:.3f} ({metrics.reachable_verdict})  "
                     f"ranks={[lm.structural_rank for lm in metrics.layers]}"
                 )
+
+                # ── 拓扑圆形图 ─────────────────────────────────────────
+                if not args.no_plot:
+                    try:
+                        layer_data = _topo_plotter.extract_layer_graph_data(model)
+                        subtitle = (
+                            f"eBOPs={metrics.measured_ebops:.0f}  "
+                            f"acc={metrics.val_acc:.4f}  "
+                            f"IBR={metrics.IBR:.2f}  PRI={metrics.PRI:.2f}  "
+                            f"ranks={[lm.structural_rank for lm in metrics.layers]}"
+                        )
+                        circle_path = (
+                            OUTPUT_DIR
+                            / f"topo_{int(target_ebops)}_{method}_circle.png"
+                        )
+                        _topo_plotter.plot_circle_graph(
+                            layer_data, circle_path,
+                            title=(
+                                f"{METHOD_LABELS.get(method, method)}"
+                                f" @ target={int(target_ebops)} eBOPs"
+                            ),
+                            subtitle=subtitle,
+                        )
+                        logger.info(f"    拓扑图: {circle_path.name}")
+                    except Exception as topo_exc:
+                        logger.warning(f"    拓扑图生成失败: {topo_exc}")
 
             except Exception as exc:
                 logger.error(f"    ✗ 失败: {exc}")
@@ -690,6 +808,9 @@ def main():
         logger.error("没有成功的实验结果!")
         return
 
+    # ── 保存 CSV ─────────────────────────────────────────────────────────
+    save_csv(all_metrics, OUTPUT_DIR / "quick_metrics_table.csv")
+
     # ── 汇总输出 ─────────────────────────────────────────────────────────
     logger.info(f"\n\n{'█'*80}")
     logger.info("                         结 果 汇 总")
@@ -699,13 +820,8 @@ def main():
     print_ranking_table(all_metrics)
     print_detailed_per_target(all_metrics)
 
-    # ── 保存 CSV ─────────────────────────────────────────────────────────
-    save_csv(all_metrics, OUTPUT_DIR / "quick_metrics_table.csv")
-
-    # ── 绘图 ─────────────────────────────────────────────────────────────
-    if not args.no_plot:
-        plot_comparison_chart(all_metrics, OUTPUT_DIR / "quick_comparison_chart.png")
-        plot_heatmap(all_metrics, OUTPUT_DIR / "quick_comparison_heatmap.png")
+    # ── 汇总对比图 (不生成矩阵热力图) ─────────────────────────────────────
+    plot_comparison_chart(all_metrics, OUTPUT_DIR / "quick_comparison_chart.png")
 
     # ── 建议 ─────────────────────────────────────────────────────────────
     logger.info(f"\n{'═'*80}")

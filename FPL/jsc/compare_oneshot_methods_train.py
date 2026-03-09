@@ -52,13 +52,16 @@ from utils.tf_device import get_tf_device
 from utils.ramanujan_budget_utils import (
     EBOPsConstantProjector,
     BetaOnlyBudgetController,
+    SpectralGradientRevivalCallback,
     _flatten_layers,
     _get_kq_var,
 )
 from run_one_shot_prune_only import (
     compute_model_ebops,
     bisect_ebops_to_target,
+    snap_active_bk,
     spectral_quant_prune_to_ebops,
+    spectral_synflow_prune_to_ebops,
     saliency_prune_to_ebops,
     snows_prune_to_ebops,
     teacher_guided_post_prune_calibration,
@@ -77,7 +80,7 @@ random.seed(42)
 # 默认配置
 # ══════════════════════════════════════════════════════════════════════════════
 
-BASELINE_CKPT  = "results/baseline/epoch=7789-val_acc=0.770-ebops=19899-val_loss=0.641.keras"
+BASELINE_CKPT  = "results/baseline/epoch=2236-val_acc=0.770-ebops=23589-val_loss=0.641.keras"
 BASELINE_EBOPS = 19899
 INPUT_H5       = "data/dataset.h5"
 BATCH_SIZE     = 33200
@@ -114,7 +117,7 @@ EARLYSTOP_PATIENCE = 5000
 parser = argparse.ArgumentParser(description='Train comparison: one-shot prune + two-phase finetune')
 parser.add_argument('--prune_method', type=str, required=True,
                     choices=['uniform', 'sensitivity', 'snip', 'grasp', 'synflow',
-                             'spectral_quant', 'snows'],
+                             'spectral_quant', 'spectral_synflow', 'snows'],
                     help='One-shot pruning method')
 parser.add_argument('--target_ebops', type=float, required=True,
                     help='Target eBOPs budget')
@@ -129,6 +132,23 @@ parser.add_argument('--functional_calibrate', action='store_true', default=False
 parser.add_argument('--functional_passes', type=int, default=2)
 parser.add_argument('--calib_overshoot', type=float, default=CALIBRATION_OVERSHOOT)
 parser.add_argument('--sample_size', type=int, default=512)
+parser.add_argument('--warm_target', type=float, default=None,
+                    help='Intermediate eBOPs for warm-start stage before final prune (must be > target_ebops). '
+                         'Runs a short train at this level first, then does the main prune.')
+parser.add_argument('--warm_epochs', type=int, default=2000,
+                    help='Training epochs for the warm-start stage (default: 2000)')
+parser.add_argument('--spectral_revival', action=argparse.BooleanOptionalAction, default=False,
+                    help='Enable SpectralGradientRevivalCallback during Phase1 (spectral methods only)')
+parser.add_argument('--revival_interval', type=int, default=300,
+                    help='Epochs between revival attempts (default: 300)')
+parser.add_argument('--revival_max_per_layer', type=int, default=8,
+                    help='Max connections revived per layer per attempt (default: 8)')
+parser.add_argument('--swap_kill', action=argparse.BooleanOptionalAction, default=False,
+                    help='Kill weakest alive connections when reviving to keep eBOPs budget')
+parser.add_argument('--revival_b_val', type=float, default=3.0,
+                    help='Initial _b value for revived connections (default: 1.2 = 1-bit, minimal eBOPs shock)')
+parser.add_argument('--phase1_beta_max', type=float, default=None,
+                    help='Override PHASE1_BETA_MAX for budget controller (default: use PHASE1_BETA_MAX=2e-4)')
 
 args, _ = parser.parse_known_args()
 
@@ -316,6 +336,16 @@ def execute_pruning(model, target_ebops, sample_input, method, teacher_model=Non
             verbose=True,
         )
 
+    elif method == 'spectral_synflow':
+        _, ssf_report = spectral_synflow_prune_to_ebops(
+            model, target_ebops=target_ebops,
+            sample_input=sample_input,
+            n_iters=5, min_degree=2, min_rank=2,
+            uniform_mix=0.35, b_floor=1.0,
+            verbose=True,
+        )
+        report['ssf_report'] = ssf_report
+
     elif method == 'snows':
         if teacher_model is None:
             raise ValueError("SNOWS requires a teacher model")
@@ -345,6 +375,8 @@ if __name__ == '__main__':
     print(f'  Source      : {args.checkpoint}')
     print(f'  Target      : ebops = {TARGET_EBOPS}')
     print(f'  Prune method: {PRUNE_METHOD}')
+    if args.warm_target is not None and float(args.warm_target) > TARGET_EBOPS:
+        print(f'  Warm-start  : {float(args.warm_target):.0f} eBOPs  ({args.warm_epochs} epochs)  → then prune to {TARGET_EBOPS:.0f}')
     print(f'  Func-calib  : {args.functional_calibrate} (passes={args.functional_passes})')
     print(f'  Phase1      : {PHASE1_EPOCHS} epochs  (recovery)')
     print(f'  Phase2      : {PHASE2_EPOCHS} epochs  (acc-max)')
@@ -367,6 +399,69 @@ if __name__ == '__main__':
     actual_baseline_ebops = local_compute_model_ebops(model, _sample_input)
     print(f'  Actual baseline EBOPs (measured): {actual_baseline_ebops:.1f}')
 
+    # ── [WARM] Optional warm-start stage ─────────────────────────────────────
+    if args.warm_target is not None and float(args.warm_target) > TARGET_EBOPS:
+        warm_target_val = float(args.warm_target)
+        warm_epochs_val = int(args.warm_epochs)
+        print(f'\n[WARM] Warm-start stage: {actual_baseline_ebops:.1f} → {warm_target_val:.1f} eBOPs  ({warm_epochs_val} epochs)')
+
+        used_warm_structured, _ = execute_pruning(
+            model, warm_target_val, _sample_input, PRUNE_METHOD,
+            teacher_model=teacher_model,
+        )
+        print_bk_stats(model, 'after warm prune')
+
+        warm_calib_target = warm_target_val * CALIBRATION_OVERSHOOT
+        if PRUNE_METHOD in ('spectral_quant', 'spectral_synflow'):
+            bisect_ebops_to_target(
+                model, target_ebops=warm_calib_target, sample_input=_sample_input,
+                tolerance=0.03, max_iter=24,
+                allow_connection_kill=not used_warm_structured,
+            )
+            n_warm_snapped = snap_active_bk(model, snap_min=1.0)
+            if n_warm_snapped > 0:
+                print(f'  [snap_active_bk] snapped {n_warm_snapped} limbo → 1-bit')
+        else:
+            bisect_ebops_to_target(
+                model, target_ebops=warm_calib_target, sample_input=_sample_input,
+                tolerance=0.05, max_iter=30,
+            )
+
+        warm_measured_ebops = local_compute_model_ebops(model, _sample_input)
+        print(f'  Warm-stage calibrated eBOPs: {warm_measured_ebops:.1f}')
+
+        _warm_ebops_cb = FreeEBOPs()
+        set_all_beta(model, PHASE1_BETA_INIT)
+        warm_budget_ctrl = BetaOnlyBudgetController(
+            target_ebops=warm_target_val, margin=0.20,
+            beta_init=PHASE1_BETA_INIT, beta_min=PHASE1_BETA_MIN, beta_max=PHASE1_BETA_MAX,
+            adjust_factor=1.15, ema_alpha=0.25, warmup_epochs=100,
+            max_change_ratio=1.5, init_ebops=warm_target_val,
+        )
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=PHASE1_LR),
+            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+            metrics=['accuracy'],
+            steps_per_execution=32,
+        )
+        model.fit(
+            dataset_train, validation_data=dataset_val,
+            epochs=warm_epochs_val,
+            callbacks=[
+                _warm_ebops_cb, warm_budget_ctrl,
+                make_lr_scheduler(PHASE1_LR, PHASE1_LR_CYCLE, PHASE1_LR_MMUL, offset=0),
+            ],
+            verbose=1,
+        )
+        print_bk_stats(model, 'after warm training')
+        res_warm = model.evaluate(dataset_val, verbose=0)
+        actual_baseline_ebops = local_compute_model_ebops(model, _sample_input)
+        print(f'  Warm-stage complete: val_acc={res_warm[1]:.4f}  eBOPs={actual_baseline_ebops:.1f}')
+        print('  → Proceeding to final prune...')
+        # rebind teacher to current warm model outputs for functional calibration
+        teacher_model = keras.models.clone_model(model)
+        teacher_model.set_weights(model.get_weights())
+
     # ── 3. 一次性剪枝 ────────────────────────────────────────────────────────
     print(f'\n[3/5] One-shot pruning ({PRUNE_METHOD}): '
           f'{actual_baseline_ebops:.1f} -> {TARGET_EBOPS}')
@@ -381,7 +476,7 @@ if __name__ == '__main__':
     print(f'  Post-prune EBOPs (measured): {post_prune_ebops:.1f}  target: {TARGET_EBOPS}')
 
     near_budget_preserve_case = (
-        PRUNE_METHOD == 'spectral_quant'
+        PRUNE_METHOD in ('spectral_quant', 'spectral_synflow')
         and (not used_structured_low_budget)
         and actual_baseline_ebops <= float(TARGET_EBOPS) * 1.6
     )
@@ -401,13 +496,18 @@ if __name__ == '__main__':
     print(f'  Calibrating to {calib_target:.1f} '
           f'(target={TARGET_EBOPS:.1f} × overshoot={CALIBRATION_OVERSHOOT})')
 
-    if PRUNE_METHOD == 'spectral_quant':
+    if PRUNE_METHOD in ('spectral_quant', 'spectral_synflow'):
         post_prune_ebops = bisect_ebops_to_target(
             model, target_ebops=calib_target, sample_input=_sample_input,
             tolerance=0.03, max_iter=24,
             b_k_min=0.20 if near_budget_preserve_case else 0.35,
             allow_connection_kill=(not used_structured_low_budget) and (not near_budget_preserve_case),
         )
+        n_snapped = snap_active_bk(model, snap_min=1.0)
+        if n_snapped > 0:
+            print(f'  [snap_active_bk] snapped {n_snapped} limbo connections → 1.0-bit')
+            post_prune_ebops = local_compute_model_ebops(model, _sample_input)
+            print(f'  Post-snap EBOPs: {post_prune_ebops:.1f}')
     else:
         post_prune_ebops = bisect_ebops_to_target(
             model, target_ebops=calib_target, sample_input=_sample_input,
@@ -429,13 +529,17 @@ if __name__ == '__main__':
     post_compile_ebops = local_compute_model_ebops(model, _sample_input)
     if abs(post_compile_ebops - calib_target) / max(calib_target, 1.0) > 0.05:
         print(f'  [WARN] Post-compile eBOPs drifted: {post_compile_ebops:.1f}. Re-calibrating...')
-        if PRUNE_METHOD == 'spectral_quant':
+        if PRUNE_METHOD in ('spectral_quant', 'spectral_synflow'):
             post_compile_ebops = bisect_ebops_to_target(
                 model, target_ebops=calib_target, sample_input=_sample_input,
                 tolerance=0.03, max_iter=24,
                 b_k_min=0.20 if near_budget_preserve_case else 0.35,
                 allow_connection_kill=(not used_structured_low_budget) and (not near_budget_preserve_case),
             )
+            n_snapped = snap_active_bk(model, snap_min=1.0)
+            if n_snapped > 0:
+                print(f'  [snap_active_bk] snapped {n_snapped} limbo connections → 1.0-bit')
+                post_compile_ebops = local_compute_model_ebops(model, _sample_input)
         else:
             post_compile_ebops = bisect_ebops_to_target(
                 model, target_ebops=calib_target, sample_input=_sample_input,
@@ -467,7 +571,7 @@ if __name__ == '__main__':
     const_projector = None
     if use_const_projector:
         const_projector = EBOPsConstantProjector(
-            target_ebops=TARGET_EBOPS, b_k_min=0.25, b_k_max=8.0,
+            target_ebops=TARGET_EBOPS, b_k_min=0.5, b_k_max=8.0,
             pruned_threshold=0.1, start_epoch=0, alpha_gamma=0.5,
             alpha_min=0.80, alpha_max=1.25, ema_alpha=0.3,
             project_activation=False, log_scale=False,
@@ -500,16 +604,42 @@ if __name__ == '__main__':
         phase1_budget_ctrl = None
     else:
         set_all_beta(model, PHASE1_BETA_INIT)
+        _p1_beta_max = args.phase1_beta_max if args.phase1_beta_max is not None else PHASE1_BETA_MAX
+        # if starting eBOPs is far above target, disable warmup + raise adjust_factor
+        _p1_warmup = 0 if (actual_baseline_ebops / TARGET_EBOPS > 1.3) else 100
+        _p1_adjust = 1.20 if (actual_baseline_ebops / TARGET_EBOPS > 1.3) else 1.15
         phase1_budget_ctrl = BetaOnlyBudgetController(
             target_ebops=TARGET_EBOPS, margin=0.20,
-            beta_init=PHASE1_BETA_INIT, beta_min=PHASE1_BETA_MIN, beta_max=PHASE1_BETA_MAX,
-            adjust_factor=1.15, ema_alpha=0.25, warmup_epochs=100,
-            max_change_ratio=1.5, init_ebops=TARGET_EBOPS,
+            beta_init=PHASE1_BETA_INIT, beta_min=PHASE1_BETA_MIN, beta_max=_p1_beta_max,
+            adjust_factor=_p1_adjust, ema_alpha=0.25, warmup_epochs=_p1_warmup,
+            max_change_ratio=1.5, init_ebops=max(actual_baseline_ebops, TARGET_EBOPS),
         )
+
+    # SpectralGradientRevivalCallback (weight-magnitude guided)
+    revival_cb = None
+    if (args.spectral_revival
+            and PRUNE_METHOD in ('spectral_quant', 'spectral_synflow')):
+        revival_cb = SpectralGradientRevivalCallback(
+            target_ebops=TARGET_EBOPS,
+            min_degree=2,
+            revival_b_val=args.revival_b_val,
+            max_revival_per_layer=args.revival_max_per_layer,
+            revival_interval=args.revival_interval,
+            ebops_deficit_threshold=0.20,
+            dead_fraction_threshold=0.90,
+            grad_min_threshold=0.0,
+            cool_down=args.revival_interval // 2,
+            swap_kill=args.swap_kill,
+        )
+        print(f'  [SpectralRevival] enabled: interval={args.revival_interval}  '
+              f'max_per_layer={args.revival_max_per_layer}  '
+              f'swap_kill={args.swap_kill}  '
+              f'b_val={args.revival_b_val}')
 
     phase1_callbacks = [
         ebops_cb, pareto_cb,
         *([const_projector] if const_projector is not None else []),
+        *([revival_cb] if revival_cb is not None else []),
         make_lr_scheduler(phase1_lr_use, PHASE1_LR_CYCLE, PHASE1_LR_MMUL, offset=0),
         trace_cb,
     ]

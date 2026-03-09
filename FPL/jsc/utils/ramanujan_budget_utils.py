@@ -976,3 +976,276 @@ class BetaOnlyBudgetController(keras.callbacks.Callback):
                 logs['rescue_alpha'] = alpha
 
         logs['beta_budget'] = self.beta_current
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SpectralGradientRevivalCallback  (A+B combined)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SpectralGradientRevivalCallback(keras.callbacks.Callback):
+    """A+B 结合的优雅复活机制。
+
+    B — 谱引导候选过滤
+    ~~~~~~~~~~~~~~~~~~~
+    对每个可剪枝层，计算当前活跃连接的入度/出度分布。
+    找出 degree < min_degree 的 "孤立节点"，将所有与之相连的
+    死连接（_b == 0）标记为候选集，确保只复活对拓扑有修复意义的连接。
+
+    A — 梯度探针排序
+    ~~~~~~~~~~~~~~~~~~~
+    将候选集中的所有死连接临时 set 到 probe_val (>0.5，使 round_conv=1)，
+    做一次批量 GradientTape 前向/后向，获取 ∂loss/∂_b 的绝对值。
+    恢复原值后，按梯度大小降序排列，每层复活 top-k 个。
+
+    这样复活的连接同时满足：
+    1. 谱/拓扑上必要（填补欠度节点）
+    2. 梯度信号上有价值（网络"想要"它们活着）
+
+    触发条件
+    --------
+    (epoch % revival_interval == 0
+     AND (eBOPs_ema < target_ebops × (1 - ebops_deficit_threshold)
+          OR bw_0bit_pct > dead_fraction_threshold × 100)
+     AND epoch > cool_down after last revival)
+
+    连接交换（Swap）
+    ----------------
+    当 EBOPsConstantProjector 存在（eBOPs 被钳位于目标附近）时，
+    直接 revive 会导致 eBOPs 超标 → projector 连续缩放 → 新连接再度死亡。
+    解决方案：每复活 k 个死连接，同时杀死 k 个当前 _b 最小的活跃连接，
+    维持 eBOPs 总量不变，让 projector 干扰降到最低。
+    """
+
+    def __init__(
+        self,
+        target_ebops: float,
+        probe_x=None,                   # deprecated, kept for backward compat
+        probe_y=None,                   # deprecated, kept for backward compat
+        min_degree: int = 2,
+        probe_val: float = 0.6,         # deprecated, kept for backward compat
+        revival_b_val: float = 1.0,     # 最终赋给复活连接的 _b 值（建议 >=1.0）
+        max_revival_per_layer: int = 8, # 每层每次最多复活几个连接
+        revival_interval: int = 200,    # 每隔多少 epoch 触发一次
+        ebops_deficit_threshold: float = 0.20,  # eBOPs < target×(1-thr) 时触发
+        dead_fraction_threshold: float = 0.90,  # 死连接比例 > thr 时也触发
+        grad_min_threshold: float = 0.0,        # 复活所需最小 score；0=仅排序
+        cool_down: int = 100,           # 上次复活后暂停 epoch 数
+        swap_kill: bool = True,         # 复活时同时淘汰等量弱连接，维持 eBOPs 预算
+    ):
+        super().__init__()
+        self.target_ebops            = float(target_ebops)
+        self.min_degree              = int(min_degree)
+        self.revival_b_val           = float(revival_b_val)
+        self.max_revival_per_layer   = int(max_revival_per_layer)
+        self.revival_interval        = int(revival_interval)
+        self.ebops_deficit_threshold = float(ebops_deficit_threshold)
+        self.dead_fraction_threshold = float(dead_fraction_threshold)
+        self.grad_min_threshold      = float(grad_min_threshold)
+        self.cool_down               = int(cool_down)
+        self.swap_kill               = bool(swap_kill)
+        self._ebops_ema              = None
+        self._last_revival_epoch     = -cool_down  # 允许第一次立即触发
+        self._total_revived          = 0
+
+    # ── 内部工具 ──────────────────────────────────────────────────────────
+
+    def _prunable_layers(self):
+        layers = []
+        for layer in _flatten_layers(self.model):
+            if not hasattr(layer, 'kernel') or not hasattr(layer, 'kq'):
+                continue
+            b_var = _get_kq_var(layer.kq, 'b')
+            if b_var is None:
+                b_var = _get_kq_var(layer.kq, 'f')
+            if b_var is None:
+                continue
+            layers.append((layer, b_var))
+        return layers
+
+    def _compute_dead_pct(self) -> float:
+        """计算全部连接中 round_conv(_b)==0 的比例（直接读 _b 变量）。"""
+        total = 0
+        dead  = 0
+        for (_layer, b_var) in self._prunable_layers():
+            b_arr = b_var.numpy()
+            total += b_arr.size
+            dead  += int((b_arr < 0.5).sum())
+        return dead / max(total, 1)
+
+    def _spectral_candidates(self, b_arr: np.ndarray) -> list[tuple[int, int]]:
+        """B: 返回所有因入度/出度不足而需要复活的候选 (row, col) 索引。
+        b_arr shape: (n_in, n_out)  —— 死连接 b==0, 活连接 b>0。
+        """
+        if b_arr.ndim == 1:
+            # 标量位宽层：无法精细复活
+            return []
+        if b_arr.ndim > 2:
+            # 展平为 2D (n_in × n_out)
+            n_in = b_arr.shape[0]
+            b_arr = b_arr.reshape(n_in, -1)
+
+        dead   = (b_arr == 0.0)        # shape (n_in, n_out)
+        active = ~dead
+
+        out_degree = active.sum(axis=1)   # 每个 input node 的出度
+        in_degree  = active.sum(axis=0)   # 每个 output node 的入度
+
+        candidates = set()
+
+        # 出度不足的 input 节点 → 该节点所有死连接均为候选
+        for r in np.where(out_degree < self.min_degree)[0]:
+            for c in np.where(dead[r])[0]:
+                candidates.add((int(r), int(c)))
+
+        # 入度不足的 output 节点 → 该节点所有死连接均为候选
+        for c in np.where(in_degree < self.min_degree)[0]:
+            for r in np.where(dead[:, c])[0]:
+                candidates.add((int(r), int(c)))
+
+        return list(candidates)
+
+    def _batch_gradient_probe(self, layer_info: list) -> dict:
+        """A: 按候选连接的权重绝对值排序（代替 GradientTape，避免 Keras3 兼容问题）。
+
+        对每层，访问 layer.kernel.numpy() 获取权重矩阵，按 |kernel[r,c]| 降序排列候选连接。
+        权重绝对值大的连接在激活后更可能对输出产生影响，因此作为复活优先级的代理。
+        若无法获取权重，则随机排序（保证有回退）。
+
+        layer_info: list of (layer, b_var, b_arr_orig, candidates, orig_shape)
+        Returns: dict { layer_idx: list of (score, r, c) } sorted desc
+        """
+        results = {}
+        for i, (layer, b_var, b_arr_orig, candidates, orig_shape) in enumerate(layer_info):
+            if not candidates:
+                results[i] = []
+                continue
+            # 尝试获取权重矩阵
+            w_mat = None
+            kernel = getattr(layer, 'kernel', None)
+            if kernel is not None:
+                try:
+                    w = np.abs(np.array(kernel))
+                    # 展平到 2D: (n_in, n_out×...)
+                    n_in = w.shape[0]
+                    w_mat = w.reshape(n_in, -1)
+                except Exception:
+                    w_mat = None
+
+            scored = []
+            for (r, c) in candidates:
+                if w_mat is not None and r < w_mat.shape[0] and c < w_mat.shape[1]:
+                    score = float(w_mat[r, c])
+                else:
+                    score = float(np.random.rand())  # 无法获取权重时随机
+                scored.append((score, r, c))
+            scored.sort(reverse=True)
+            results[i] = scored
+        return results
+
+    # ── Callback 钩子 ──────────────────────────────────────────────────────
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        raw_ebops = float(logs.get('ebops', float('nan')))
+        if not math.isfinite(raw_ebops) or raw_ebops <= 0:
+            return
+
+        # EMA 平滑
+        if self._ebops_ema is None:
+            self._ebops_ema = raw_ebops
+        else:
+            self._ebops_ema = 0.3 * raw_ebops + 0.7 * self._ebops_ema
+
+        # 触发条件检查 — 双路触发
+        deficit_floor = self.target_ebops * (1.0 - self.ebops_deficit_threshold)
+        ebops_starved = (self._ebops_ema < deficit_floor)
+
+        # bw_0bit_pct 只存在于 progbar，不在 logs dict —— 直接从 _b 变量计算
+        bw_0bit_pct = self._compute_dead_pct()
+        topology_dead = (bw_0bit_pct > self.dead_fraction_threshold)
+
+        # --- DEBUG (remove after confirming) ---
+        if epoch % self.revival_interval == 0:
+            print(f'  [RevivalDBG] epoch={epoch} ebops_ema={self._ebops_ema:.1f} '
+                  f'deficit_floor={deficit_floor:.1f} ebops_starved={ebops_starved} '
+                  f'bw_0bit_pct={bw_0bit_pct*100:.2f}% topo_dead={topology_dead} '
+                  f'cooldown_ok={epoch - self._last_revival_epoch >= self.cool_down}')
+
+        if not (ebops_starved or topology_dead):
+            return                                     # 两路均不触发
+        if epoch % self.revival_interval != 0:
+            return                                     # 不在复活窗口
+        if (epoch - self._last_revival_epoch) < self.cool_down:
+            return                                     # 冷却期内
+
+        # ── 主流程 ──────────────────────────────────────────────────────
+        pl = self._prunable_layers()
+        if not pl:
+            return
+
+        layer_info = []
+        for (layer, b_var) in pl:
+            b_arr = b_var.numpy()
+            orig_shape = b_arr.shape
+            b_2d = b_arr.reshape(b_arr.shape[0], -1) if b_arr.ndim > 2 else b_arr
+            candidates = self._spectral_candidates(b_2d)
+            layer_info.append((layer, b_var, b_arr, candidates, orig_shape))
+
+        total_candidates = sum(len(info[3]) for info in layer_info)
+        if total_candidates == 0:
+            # 谱结构已满足最小度，不复活
+            return
+
+        # 批量梯度探针
+        ranked = self._batch_gradient_probe(layer_info)
+
+        # 复活 top-k （+ swap-kill：同时淘汰等量弱连接，维持 eBOPs 预算）
+        n_revived_epoch = 0
+        n_killed_epoch  = 0
+        for i, (layer, b_var, b_arr, candidates, orig_shape) in enumerate(layer_info):
+            top_k = ranked.get(i, [])
+            top_k = [x for x in top_k if x[0] >= self.grad_min_threshold]
+            top_k = top_k[:self.max_revival_per_layer]
+            if not top_k:
+                continue
+            b_new = b_arr.copy()
+            b2d = b_new.reshape(b_arr.shape[0], -1) if b_arr.ndim > 2 else b_new
+
+            # Swap-kill: 找出等量的最弱活跃连接并杀死
+            kill_set: list[tuple[int, int]] = []
+            if self.swap_kill:
+                revived_flat = {(r, c) for (_, r, c) in top_k}
+                active_conns = []
+                for r in range(b2d.shape[0]):
+                    for c in range(b2d.shape[1]):
+                        if b2d[r, c] > 0.0 and (r, c) not in revived_flat:
+                            active_conns.append((float(b2d[r, c]), r, c))
+                # 按 _b 升序（最弱在前）
+                active_conns.sort()
+                kill_set = [(r, c) for (_, r, c) in active_conns[:len(top_k)]]
+                for (r, c) in kill_set:
+                    b2d[r, c] = 0.0
+
+            # 复活：赋 revival_b_val（不是 probe_val）
+            for (g_abs, r, c) in top_k:
+                b2d[r, c] = self.revival_b_val
+            if b_arr.ndim > 2:
+                b_new = b2d.reshape(orig_shape)
+            b_var.assign(b_new.astype(np.float32))
+            n_revived_epoch += len(top_k)
+            n_killed_epoch  += len(kill_set)
+            lname = getattr(layer, 'name', str(id(layer)))
+            print(f'  [Revival] {lname}: revived={len(top_k)} killed={len(kill_set)} '
+                  f'(candidates={len(candidates)}, '
+                  f'top |grad|={top_k[0][0]:.3e}..{top_k[-1][0]:.3e})')
+
+        if n_revived_epoch > 0:
+            self._last_revival_epoch = epoch
+            self._total_revived += n_revived_epoch
+            trig_reason = []
+            if ebops_starved:  trig_reason.append(f'eBOPs_starved({self._ebops_ema:.1f}<{deficit_floor:.1f})')
+            if topology_dead:  trig_reason.append(f'topo_dead(0bit={bw_0bit_pct*100:.1f}%)')
+            print(f'  [Revival] epoch={epoch}  revived={n_revived_epoch}  killed={n_killed_epoch}  '
+                  f'total_revived={self._total_revived}  '
+                  f'trigger=[{", ".join(trig_reason)}]')
+            logs['revival_count'] = n_revived_epoch

@@ -185,7 +185,7 @@ tf.random.set_seed(42)
 # 配置
 # ══════════════════════════════════════════════════════════════════════════════
 
-BASELINE_CKPT = "results/baseline/epoch=7789-val_acc=0.770-ebops=19899-val_loss=0.641.keras"
+BASELINE_CKPT = "results/baseline/epoch=2236-val_acc=0.770-ebops=23589-val_loss=0.641.keras"
 BASELINE_DIR  = Path("results/baseline")
 INPUT_H5      = "data/dataset.h5"
 OUTPUT_DIR    = Path("results/spectral_vs_natural_v2")
