@@ -29,7 +29,7 @@ from utils.ramanujan_budget_utils import _flatten_layers
 from utils.topology_graph_plot_utils import TopologyGraphPlotter
 
 DEFAULT_CHECKPOINT = "results/baseline/epoch=7789-val_acc=0.770-ebops=19899-val_loss=0.641.keras"
-DEFAULT_METHODS = ["baseline", "uniform", "sensitivity", "snip", "grasp", "synflow", "spectral_quant", "snows"]
+DEFAULT_METHODS = ["baseline", "uniform", "sensitivity", "snip", "grasp", "synflow", "spectral_quant", "spectral_path", "snows"]
 DEFAULT_TARGETS = [400, 1500, 2500]
 
 

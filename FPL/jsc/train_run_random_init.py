@@ -52,7 +52,7 @@ random.seed(42)
 # 配置
 # ══════════════════════════════════════════════════════════════════════════════
 
-TARGET_EBOPS = 2001
+TARGET_EBOPS = 3162
 
 input_folder = 'data/dataset.h5'
 batch_size   = 33200

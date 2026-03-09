@@ -121,6 +121,410 @@ def _build_topk_mask_with_connectivity(weight_2d: np.ndarray, degree: int) -> np
     return mask
 
 
+def _forward_reachable(masks: list[np.ndarray]) -> list[np.ndarray]:
+    if not masks:
+        return []
+    reachable = [np.ones(masks[0].shape[0], dtype=bool)]
+    for mask in masks:
+        nxt = np.any(mask > 0.5, axis=0) & ((reachable[-1].astype(np.float32) @ (mask > 0.5).astype(np.float32)) > 0)
+        reachable.append(nxt.astype(bool))
+    return reachable
+
+
+def _backward_reachable(masks: list[np.ndarray]) -> list[np.ndarray]:
+    if not masks:
+        return []
+    live = [None] * (len(masks) + 1)
+    live[-1] = np.ones(masks[-1].shape[1], dtype=bool)
+    for idx in range(len(masks) - 1, -1, -1):
+        mask = masks[idx] > 0.5
+        prev = np.any(mask, axis=1) & (((mask.astype(np.float32)) @ live[idx + 1].astype(np.float32)) > 0)
+        live[idx] = prev.astype(bool)
+    return live
+
+
+def _prune_to_effective_paths(masks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, float]]:
+    masks = [np.array(m, dtype=np.float32) for m in masks]
+    if not masks:
+        return masks, {"effective_paths": 0.0, "reachable_outputs": 0.0}
+
+    changed = True
+    while changed:
+        changed = False
+        fwd = _forward_reachable(masks)
+        bwd = _backward_reachable(masks)
+        new_masks = []
+        for idx, mask in enumerate(masks):
+            keep = (mask > 0.5) & fwd[idx][:, None] & bwd[idx + 1][None, :]
+            new_mask = keep.astype(np.float32)
+            if not np.array_equal(new_mask, mask):
+                changed = True
+            new_masks.append(new_mask)
+        masks = new_masks
+
+    path_counts = np.ones(masks[0].shape[0], dtype=np.float64)
+    for mask in masks:
+        path_counts = np.clip(path_counts @ (mask > 0.5).astype(np.float64), 0.0, 1e18)
+    effective_paths = float(np.sum(path_counts))
+    reachable_outputs = float(np.sum(path_counts > 0))
+    return masks, {
+        "effective_paths": effective_paths,
+        "reachable_outputs": reachable_outputs,
+    }
+
+
+def _best_output_paths(kernels: list[np.ndarray]) -> list[np.ndarray]:
+    if not kernels:
+        return []
+    path_masks = [np.zeros_like(k, dtype=np.float32) for k in kernels]
+    eps = 1e-12
+    n_layers = len(kernels)
+
+    # Dynamic programming over nodes: best path score from any input to each node.
+    prev_score = np.zeros(kernels[0].shape[0], dtype=np.float64)
+    parents = []
+    for kernel in kernels:
+        score_mat = np.log(np.abs(kernel).astype(np.float64) + eps)
+        total = prev_score[:, None] + score_mat
+        parent = np.argmax(total, axis=0).astype(np.int32)
+        cur_score = total[parent, np.arange(total.shape[1])]
+        parents.append(parent)
+        prev_score = cur_score
+
+    out_dim = kernels[-1].shape[1]
+    for out_idx in range(out_dim):
+        node = int(out_idx)
+        for layer_idx in range(n_layers - 1, -1, -1):
+            prev_node = int(parents[layer_idx][node])
+            path_masks[layer_idx][prev_node, node] = 1.0
+            node = prev_node
+    return path_masks
+
+
+def _compose_path_scores(kernels: list[np.ndarray], masks: list[np.ndarray]) -> list[np.ndarray]:
+    bool_masks = [(m > 0.5).astype(np.float64) for m in masks]
+    if not bool_masks:
+        return []
+    fwd = [np.ones(bool_masks[0].shape[0], dtype=np.float64)]
+    for mask in bool_masks:
+        fwd.append(np.clip(fwd[-1] @ mask, 0.0, 1e18))
+    bwd = [None] * (len(bool_masks) + 1)
+    bwd[-1] = np.ones(bool_masks[-1].shape[1], dtype=np.float64)
+    for idx in range(len(bool_masks) - 1, -1, -1):
+        bwd[idx] = np.clip(bool_masks[idx] @ bwd[idx + 1], 0.0, 1e18)
+    scores = []
+    for idx, kernel in enumerate(kernels):
+        path_contrib = fwd[idx][:, None] * bwd[idx + 1][None, :]
+        abs_w = np.abs(kernel).astype(np.float64)
+        denom = float(np.max(abs_w)) + 1e-12
+        score = (abs_w / denom) * np.log1p(path_contrib)
+        scores.append(score.astype(np.float32))
+    return scores
+
+
+def _mask_has_output_paths(masks: list[np.ndarray]) -> bool:
+    if not masks:
+        return False
+    _, stats = _prune_to_effective_paths(masks)
+    return int(stats["reachable_outputs"]) == int(masks[-1].shape[1])
+
+
+def _apply_structured_masks_with_quant(
+    layers,
+    masks: list[np.ndarray],
+    per_layer_bk: dict[str, float],
+    b_floor: float,
+    b_ceiling: float,
+):
+    for layer, mask in zip(layers, masks):
+        kernel = layer.kernel.numpy().astype(np.float32)
+        kq = layer.kq
+        active = mask > 0.5
+        kernel_new = (kernel * mask).astype(np.float32)
+        active_abs = np.abs(kernel[active])
+        if active_abs.size > 0:
+            ref_abs = active_abs[active_abs > 0.0]
+            if ref_abs.size == 0:
+                global_abs = np.abs(kernel[np.abs(kernel) > 0.0])
+                ref_abs = global_abs if global_abs.size > 0 else np.array([1e-3], dtype=np.float32)
+            mag_floor = float(max(np.percentile(ref_abs, 25) * 0.50, 1e-3))
+            weak = active & (np.abs(kernel_new) < mag_floor)
+            if np.any(weak):
+                signs = np.sign(kernel).astype(np.float32)
+                signs[signs == 0.0] = 1.0
+                kernel_new[weak] = signs[weak] * mag_floor
+        layer.kernel.assign(kernel_new.astype(np.float32))
+
+        b_var = _get_kq_var(kq, "b")
+        if b_var is None:
+            b_var = _get_kq_var(kq, "f")
+        i_var = _get_kq_var(kq, "i")
+        k_var = _get_kq_var(kq, "k")
+
+        if b_var is not None:
+            b_old = b_var.numpy().astype(np.float32)
+            abs_k = np.abs(kernel_new)
+            denom = float(np.max(abs_k)) + 1e-12
+            importance = abs_k / denom
+            b_base = float(np.clip(max(per_layer_bk.get(layer.name, b_floor), 2.0), b_floor, b_ceiling))
+            b_active = np.clip(np.maximum(b_old, b_base) * (0.8 + 0.4 * importance), b_floor, b_ceiling)
+            b_new = np.where(mask > 0.5, b_active, 0.0)
+            b_var.assign(b_new.astype(np.float32))
+        if i_var is not None:
+            i_old = i_var.numpy().astype(np.float32)
+            i_var.assign(np.where(mask > 0.5, np.clip(i_old, -2.0, 6.0), -16.0).astype(np.float32))
+        if k_var is not None:
+            k_var.assign(np.where(mask > 0.5, 1.0, 0.0).astype(np.float32))
+
+        bq = getattr(layer, "bq", None)
+        if bq is not None:
+            cols_active = np.sum(mask > 0.5, axis=0) > 0
+            bb_var = _get_kq_var(bq, "b")
+            if bb_var is None:
+                bb_var = _get_kq_var(bq, "f")
+            bi_var = _get_kq_var(bq, "i")
+            bk_var = _get_kq_var(bq, "k")
+            if bb_var is not None:
+                bb_old = bb_var.numpy().astype(np.float32)
+                bb_floor = float(np.clip(max(float(b_floor), 2.0), b_floor, b_ceiling))
+                bb_var.assign(np.where(cols_active, np.clip(np.maximum(bb_old, bb_floor), bb_floor, b_ceiling), 0.0).astype(np.float32))
+            if bi_var is not None:
+                bi_old = bi_var.numpy().astype(np.float32)
+                bi_var.assign(np.where(cols_active, np.clip(bi_old, -2.0, 6.0), -16.0).astype(np.float32))
+            if bk_var is not None:
+                bk_var.assign(np.where(cols_active, 1.0, 0.0).astype(np.float32))
+
+
+def spectral_path_prune_to_ebops(
+    model,
+    target_ebops: float,
+    sample_input,
+    min_degree: int = 2,
+    min_input_width: int = 4,
+    min_hidden_width: int = 4,
+    b_floor: float = 0.25,
+    b_ceiling: float = 6.0,
+    near_budget_ratio: float = 1.6,
+    high_budget_ratio: float = 0.45,
+    verbose: bool = True,
+):
+    """Connectivity-aware pruning based on a path-connected node subnetwork.
+
+    Strategy:
+    - keep all output nodes
+    - choose input/hidden node subsets with spectral/path saliency under budget
+    - connect consecutive kept node sets as a chain subnetwork
+
+    This guarantees:
+    - every output is connected to the selected input set
+    - no kept hidden node is only-in or only-out
+    - no hidden/output layer collapse
+    """
+    current_ebops = compute_model_ebops(model, sample_input)
+    budget_ratio = float(target_ebops) / max(float(current_ebops), 1.0)
+    if current_ebops <= float(target_ebops) * float(near_budget_ratio):
+        if verbose:
+            print(
+                f"[SpectralPathPruner] near-budget preserve mode: "
+                f"current={current_ebops:.1f}, target={target_ebops:.1f}"
+            )
+        return current_ebops, {"effective_paths": 0.0, "reachable_outputs": 0.0, "mode": "preserve"}
+
+    if budget_ratio >= float(high_budget_ratio):
+        if verbose:
+            print(
+                f"[SpectralPathPruner] high-budget fallback to sensitivity: "
+                f"target/current={budget_ratio:.3f} >= {high_budget_ratio:.3f}"
+            )
+        pruner = SensitivityAwarePruner(
+            target_ebops=float(target_ebops),
+            pruned_threshold=0.1,
+            b_k_min=max(float(b_floor), 0.20),
+        )
+        pruner.prune_to_ebops(model, current_ebops=current_ebops, verbose=verbose)
+        measured = compute_model_ebops(model, sample_input)
+        return measured, {"effective_paths": 0.0, "reachable_outputs": 0.0, "mode": "sensitivity_fallback"}
+
+    layers = _dense_prunable_layers(model)
+    if len(layers) < 2:
+        measured = compute_model_ebops(model, sample_input)
+        return measured, {"effective_paths": 0.0, "reachable_outputs": 0.0, "mode": "no_layers"}
+
+    weights = [np.array(layer.kernel.numpy(), dtype=np.float32) for layer in layers]
+    widths = [int(weights[0].shape[0])] + [int(w.shape[1]) for w in weights]
+    hidden_idx = list(range(1, len(widths) - 1))
+    removable_idx = list(range(0, len(widths) - 1))  # input + hidden, outputs fixed
+
+    from keras import ops
+    _forward_update_ebops_no_bn_drift(model, sample_input)
+    edge_costs = []
+    for layer in layers:
+        if getattr(layer, "_ebops", None) is not None:
+            layer_ebops = float(int(ops.convert_to_numpy(layer._ebops)))
+        else:
+            layer_ebops = 0.0
+        active = _layer_active_mask(layer)
+        n_active = int(np.sum(active))
+        if n_active <= 0:
+            n_active = int(np.prod(layer.kernel.shape))
+        edge_costs.append(layer_ebops / max(n_active, 1))
+
+    per_layer_bk = compute_bw_aware_degree(
+        model,
+        target_ebops=float(target_ebops),
+        b_a_init=3.0,
+        b_k_min=b_floor,
+        b_k_max=b_ceiling,
+        multiplier=1.2,
+        min_degree=min_degree,
+        budget_weight="capacity",
+        verbose=False,
+    )[1]
+
+    saliency = {}
+    remove_order = {}
+    keep_map = {}
+    removed_ptr = {}
+    min_keep = {}
+    # Input nodes: prefer keeping rows with stronger first-layer support.
+    input_score = np.mean(np.abs(weights[0]), axis=1)
+    saliency[0] = input_score
+    remove_order[0] = np.argsort(input_score).tolist()
+    keep_map[0] = np.ones_like(input_score, dtype=bool)
+    removed_ptr[0] = 0
+    min_keep[0] = int(max(2, min(min_input_width, len(input_score))))
+    for h in hidden_idx:
+        prev_w = np.abs(weights[h - 1])
+        next_w = np.abs(weights[h])
+        # Path-aware node score: good support from previous layer and to next layer.
+        s = np.mean(prev_w, axis=0) * np.mean(next_w, axis=1)
+        saliency[h] = s
+        remove_order[h] = np.argsort(s).tolist()
+        keep_map[h] = np.ones_like(s, dtype=bool)
+        removed_ptr[h] = 0
+        min_keep[h] = int(max(2, min(min_hidden_width, len(s))))
+
+    def predict_ebops(curr_widths):
+        total = 0.0
+        for li, c in enumerate(edge_costs):
+            total += c * max(curr_widths[li], curr_widths[li + 1])
+        return total
+
+    def pick_next_removal(floor_map):
+        best = None
+        for h in removable_idx:
+            if widths[h] <= floor_map[h]:
+                continue
+            ptr = removed_ptr[h]
+            order = remove_order[h]
+            while ptr < len(order) and (not keep_map[h][order[ptr]]):
+                ptr += 1
+            removed_ptr[h] = ptr
+            if ptr >= len(order):
+                continue
+            n = order[ptr]
+            penalty = float(saliency[h][n]) + 1e-9
+            next_widths = list(widths)
+            next_widths[h] -= 1
+            delta = predict_ebops(widths) - predict_ebops(next_widths)
+            score = penalty / max(delta, 1e-9)
+            if best is None or score < best[0]:
+                best = (score, h, n)
+        return best
+
+    def build_masks():
+        masks_local = []
+        for li, layer in enumerate(layers):
+            in_dim, out_dim = layer.kernel.shape
+            if li == 0:
+                row_idx = np.flatnonzero(keep_map[0])
+            else:
+                row_idx = np.flatnonzero(keep_map[li])
+            if li == len(layers) - 1:
+                col_idx = np.arange(out_dim, dtype=int)
+            else:
+                col_idx = np.flatnonzero(keep_map[li + 1])
+            mask = np.zeros((in_dim, out_dim), dtype=np.float32)
+            if row_idx.size > 0 and col_idx.size > 0:
+                # Two directional covering passes: every kept src has an outgoing edge,
+                # every kept dst has an incoming edge. This preserves path-connectivity
+                # without wasting budget on full bipartite wiring.
+                for ridx, src in enumerate(row_idx):
+                    dst = col_idx[ridx % len(col_idx)]
+                    mask[src, dst] = 1.0
+                for cidx, dst in enumerate(col_idx):
+                    src = row_idx[cidx % len(row_idx)]
+                    mask[src, dst] = 1.0
+            masks_local.append(mask)
+        return masks_local
+
+    # Greedily remove weakest hidden nodes until the chain subnetwork meets budget.
+    guard = 0
+    while predict_ebops(widths) > target_ebops * 1.05:
+        guard += 1
+        if guard > 10000:
+            break
+        best = pick_next_removal(min_keep)
+        if best is None:
+            break
+        _, h, n = best
+        keep_map[h][n] = False
+        widths[h] -= 1
+        removed_ptr[h] += 1
+
+    masks = build_masks()
+    _apply_structured_masks_with_quant(layers, masks, per_layer_bk, b_floor=b_floor, b_ceiling=b_ceiling)
+    measured = compute_model_ebops(model, sample_input)
+    hard_min_keep = {0: int(max(2, min(2, len(input_score))))}
+    for h in hidden_idx:
+        hard_min_keep[h] = int(max(1, min(2, len(saliency[h]))))
+
+    refine_guard = 0
+    while measured > float(target_ebops) * 1.02:
+        refine_guard += 1
+        if refine_guard > 10000:
+            break
+        best = pick_next_removal(hard_min_keep)
+        if best is None:
+            break
+        _, h, n = best
+        keep_map[h][n] = False
+        widths[h] -= 1
+        removed_ptr[h] += 1
+        masks = build_masks()
+        _apply_structured_masks_with_quant(layers, masks, per_layer_bk, b_floor=b_floor, b_ceiling=b_ceiling)
+        measured = compute_model_ebops(model, sample_input)
+
+    input_keep = widths[0]
+    hidden_keep = [widths[h] for h in hidden_idx]
+    output_keep = widths[-1]
+    paths_per_output = float(input_keep * np.prod(hidden_keep)) if hidden_keep else float(input_keep)
+    path_stats = {
+        "effective_paths": float(paths_per_output * output_keep),
+        "reachable_outputs": float(output_keep),
+    }
+    if verbose:
+        print(
+            f"[SpectralPathPruner] measured_ebops={measured:.1f}  target={target_ebops:.1f}  "
+            f"effective_paths={path_stats['effective_paths']:.1f}  reachable_outputs={path_stats['reachable_outputs']:.0f}"
+        )
+        for layer, mask in zip(layers, masks):
+            col_deg = np.sum(mask > 0.5, axis=0)
+            row_deg = np.sum(mask > 0.5, axis=1)
+            print(
+                f"  [SpectralPathPruner] {layer.name:20s}  "
+                f"deg_col_mean={float(np.mean(col_deg)):.2f}  "
+                f"deg_row_zero={int(np.sum(row_deg == 0))}"
+            )
+    return measured, {
+        "effective_paths": float(path_stats["effective_paths"]),
+        "reachable_outputs": float(path_stats["reachable_outputs"]),
+        "selected_inputs": int(input_keep),
+        "selected_hidden": [int(v) for v in hidden_keep],
+        "mode": "spectral_path",
+    }
+
+
 def _dense_prunable_layers(model):
     layers = []
     for layer in _flatten_layers(model):
@@ -1796,7 +2200,7 @@ def main():
                         default='results/baseline_copy/epoch=3699-val_acc=0.770-ebops=23293-val_loss=0.640.keras')
     parser.add_argument('--target_ebops', type=float, default=200.0)
     parser.add_argument('--prune_method', type=str, default='sensitivity',
-                        choices=['uniform', 'sensitivity', 'snip', 'grasp', 'synflow', 'spectral_quant', 'snows'])
+                        choices=['uniform', 'sensitivity', 'snip', 'grasp', 'synflow', 'spectral_quant', 'spectral_path', 'snows'])
     parser.add_argument('--input_h5', type=str, default='data/dataset.h5')
     parser.add_argument('--sample_size', type=int, default=512)
     parser.add_argument('--calibrate', action='store_true', default=True,
@@ -1879,6 +2283,7 @@ def main():
     used_structured_low_budget = False
     snows_report = None
     saliency_report = None
+    spectral_path_report = None
 
     if args.prune_method == 'sensitivity':
         pruner = SensitivityAwarePruner(target_ebops=args.target_ebops, pruned_threshold=0.1, b_k_min=0.3)
@@ -1912,6 +2317,19 @@ def main():
             verbose=True,
         )
         used_structured_low_budget = bool(snows_report.get('used_structured_low_budget', False))
+    elif args.prune_method == 'spectral_path':
+        _, spectral_path_report = spectral_path_prune_to_ebops(
+            model,
+            target_ebops=args.target_ebops,
+            sample_input=sample_input,
+            min_degree=args.min_degree,
+            min_hidden_width=args.min_hidden_width,
+            b_floor=args.b_floor,
+            near_budget_ratio=args.near_budget_ratio,
+            high_budget_ratio=args.high_budget_ratio,
+            verbose=True,
+        )
+        used_structured_low_budget = True
     else:
         _, used_structured_low_budget = spectral_quant_prune_to_ebops(
             model,
@@ -1935,6 +2353,11 @@ def main():
             f"{saliency_report['kept_connections']}/{saliency_report['total_active_connections']}  "
             f"pre_bisect_ebops={saliency_report['pre_bisect_ebops']:.1f}"
         )
+    if spectral_path_report is not None:
+        print(
+            f"  [SPECTRAL_PATH] effective_paths={spectral_path_report['effective_paths']:.1f}  "
+            f"reachable_outputs={spectral_path_report['reachable_outputs']:.0f}"
+        )
 
     post_func_calib_ebops = post_prune_ebops
     if args.functional_calibrate:
@@ -1950,9 +2373,9 @@ def main():
         print(f'  Post-functional-calib EBOPs (measured): {post_func_calib_ebops:.1f}')
 
     if args.calibrate:
-        preserve_connectivity = (args.prune_method == 'spectral_quant' and used_structured_low_budget)
+        preserve_connectivity = (args.prune_method in {'spectral_quant', 'spectral_path'} and used_structured_low_budget)
         near_budget_preserve_case = (
-            args.prune_method == 'spectral_quant'
+            args.prune_method in {'spectral_quant', 'spectral_path'}
             and (not used_structured_low_budget)
             and baseline_ebops <= float(args.target_ebops) * float(args.near_budget_ratio)
         )
@@ -1962,7 +2385,7 @@ def main():
             sample_input=sample_input,
             tolerance=0.02,
             max_iter=30,
-            b_k_min=(0.20 if near_budget_preserve_case else args.b_floor) if args.prune_method == 'spectral_quant' else 0.01,
+            b_k_min=(0.20 if near_budget_preserve_case else args.b_floor) if args.prune_method in {'spectral_quant', 'spectral_path'} else 0.01,
             allow_connection_kill=(not preserve_connectivity) and (not near_budget_preserve_case),
         )
     else:
@@ -2007,6 +2430,7 @@ def main():
         'functional_calibrated': bool(args.functional_calibrate),
         'functional_passes': int(args.functional_passes),
         'saliency_report': saliency_report,
+        'spectral_path_report': spectral_path_report,
         'snows_report': snows_report,
         'weights_path': str(weights_path),
     }

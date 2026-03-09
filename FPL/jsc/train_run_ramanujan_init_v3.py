@@ -1,36 +1,36 @@
 """
-Ramanujan 图初始化 v2 — 两阶段训练 + eBOPs 扫描
+Ramanujan 图初始化 v3 — 三阶段训练：先探索再压缩
 ================================================
-修复 v1 的训练策略问题，对齐 prune_finetune 的最优实践：
+v2 → v3 的核心改进：前期不压缩 eBOPs，充分在稀疏拓扑下探索精度空间，
+再逐步压缩到目标 eBOPs，最后精调。
 
-v1 → v2 的改进
---------------
-1. 两阶段训练（对齐 prune_finetune）：
-   - Phase 1 (恢复): 高 LR(2e-3), 宽 margin(±20%), mask 固定
-   - Phase 2 (精调): 低 LR(5e-4), 窄 margin(±5%), mask 释放, Adam 重置
-2. KQBStabilizer 稳定初期 kq.b，防止 eBOPs 漂移
-3. 校准到 1.00× 目标（不是 1.10×），让 budget controller 精确维持
-4. mask 保护只在 Phase 1，Phase 2 完全释放让 HGQ 自由优化拓扑
-5. 支持 --sweep 模式批量测试多个 eBOPs 目标，寻找 Pareto knee
+三阶段策略
+----------
+Phase 0 (拓扑探索):
+  - 无 budget 压力（beta ≈ 0），mask 固定（Ramanujan 拓扑完全保护）
+  - 高 LR (2e-3)，让模型在固定稀疏拓扑下充分收敛，找到精度上界
+  - 目的：在剪枝后的拓扑上充分训练，避免后续压缩从未收敛的点出发
 
-理论分析
+Phase 1 (eBOPs 压缩):
+  - 开启 BudgetController，逐步将 eBOPs 压缩至 target
+  - mask 从 hold 开始, fade 阶段逐渐放开
+  - 中等 LR (1e-3)，确保精度不在压缩过程中崩溃
+
+Phase 2 (精调):
+  - 低 LR (5e-4)，窄 margin (±5%)，mask 完全释放，Adam 重置
+  - 精确维持 target eBOPs，最大化精度
+
+与 v2 的关键区别
+----------------
+v2: Phase1 从 calibrated start 立即开始压缩 → 模型权重尚未适应稀疏拓扑
+v3: Phase0 先在稀疏拓扑下充分训练 → Phase1 从已收敛的好初始点开始压缩
+
+理论依据
 --------
-模型: input(16) → t1(64) → t2(64) → t3(32) → out(5)
-Ramanujan 谱条件 d-regular graph: λ₂ ≤ 2√(d-1)
-
-最小 Ramanujan 度（各层）:
-  t1:  d=6  (in=16, √16×1.5=6,  sparsity=62.5%)   384/1024 active
-  t2:  d=12 (in=64, √64×1.5=12, sparsity=81.2%)   768/4096 active
-  t3:  d=12 (in=64, √64×1.5=12, sparsity=81.2%)   384/2048 active
-  out: d=8  (in=32, √32×1.5=8,  sparsity=75.0%)    40/160 active
-
-最小谱条件度 (2√(N-1)+1):
-  t1:  d≥9   (in=16)  → mult=1.5 给 d=6 不满足严格谱条件
-  t2:  d≥17  (in=64)  → mult=1.5 给 d=12 不满足严格谱条件
-  → 说明 mult=1.5 是经验值，不是理论下限；对于小网络够用
-
-HGQ EBOPs 与 kq.b 的关系是非线性的（量化阶梯），
-实际可达的最小 eBOPs ≈ 660（所有活跃连接 b_k→0.5, 即 1-bit 量化）
+稀疏 Ramanujan 拓扑的表达能力需要足够的训练时间才能被充分挖掘。
+在量化位宽尚未压缩时（b_k 较高）参数充足，模型可以学到更好的权重分布，
+这些权重分布在后续 eBOPs 压缩时提供了更好的起点，类似于渐进式剪枝中
+"先训好再剪"的策略。
 """
 
 import os
@@ -75,18 +75,24 @@ DEFAULT_CONFIG = dict(
     target_ebops    = 3162,
     init_bw_k       = 3,
 
-    # Phase 1: 恢复 (对齐 prune_finetune)
-    phase1_epochs   = 5000,
-    phase1_lr       = 2e-3,
-    phase1_lr_cycle = 2000,
-    phase1_lr_mmul  = 0.9,
+    # Phase 0: 拓扑探索（新增，无 budget 压力）
+    phase0_epochs   = 3000,
+    phase0_lr       = 2e-3,
+    phase0_lr_cycle = 1000,
+    phase0_lr_mmul  = 0.9,
+
+    # Phase 1: eBOPs 压缩（对应 v2 Phase 1，但起点已充分训练）
+    phase1_epochs   = 4000,
+    phase1_lr       = 1e-3,
+    phase1_lr_cycle = 1500,
+    phase1_lr_mmul  = 0.92,
     phase1_beta_init = 5e-7,
     phase1_beta_min  = 1e-8,
     phase1_beta_max  = 2e-4,
     phase1_margin    = 0.20,
 
-    # Phase 2: 精调 (对齐 prune_finetune)
-    phase2_epochs   = 10000,
+    # Phase 2: 精调（对齐 v2 Phase 2）
+    phase2_epochs   = 8000,
     phase2_lr       = 5e-4,
     phase2_lr_cycle = 800,
     phase2_lr_mmul  = 0.95,
@@ -99,7 +105,7 @@ DEFAULT_CONFIG = dict(
     ram_min_degree  = 4,
     ram_budget_weight = 'capacity',
 
-    # KQB Stabilizer
+    # KQB Stabilizer（Phase 1 用，防止压缩过程中 b_k 暴跌）
     kqb_hold_epochs    = 50,
     kqb_release_epochs = 200,
     kqb_hold_strength  = 0.8,
@@ -109,28 +115,32 @@ DEFAULT_CONFIG = dict(
 )
 
 # ── 命令行参数 ────────────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description='Ramanujan-init v2: two-phase training with eBOPs sweep')
+parser = argparse.ArgumentParser(
+    description='Ramanujan-init v3: Explore → Compress → Finetune'
+)
 parser.add_argument('--target_ebops',    type=float, default=DEFAULT_CONFIG['target_ebops'])
+parser.add_argument('--phase0_epochs',   type=int,   default=DEFAULT_CONFIG['phase0_epochs'])
 parser.add_argument('--phase1_epochs',   type=int,   default=DEFAULT_CONFIG['phase1_epochs'])
 parser.add_argument('--phase2_epochs',   type=int,   default=DEFAULT_CONFIG['phase2_epochs'])
+parser.add_argument('--phase0_lr',       type=float, default=DEFAULT_CONFIG['phase0_lr'])
 parser.add_argument('--phase1_lr',       type=float, default=DEFAULT_CONFIG['phase1_lr'])
 parser.add_argument('--phase2_lr',       type=float, default=DEFAULT_CONFIG['phase2_lr'])
 parser.add_argument('--init_bw_k',       type=int,   default=DEFAULT_CONFIG['init_bw_k'])
 parser.add_argument('--ram_multiplier',  type=float, default=DEFAULT_CONFIG['ram_multiplier'])
 parser.add_argument('--ram_min_degree',  type=int,   default=DEFAULT_CONFIG['ram_min_degree'])
 parser.add_argument('--mask_hold',       type=int,   default=None,
-                    help='Epochs to hold mask (default: phase1_epochs, i.e., entire Phase 1)')
-parser.add_argument('--mask_fade',       type=int,   default=3000,
-                    help='Fade epochs for mask release (default: 3000, into Phase 2)')
+                    help='Epochs (absolute) to hold mask rigid; default = phase0_epochs + phase1_epochs')
+parser.add_argument('--mask_fade',       type=int,   default=2000,
+                    help='Fade epochs for mask release (default: 2000, spanning Phase 1 → Phase 2)')
 parser.add_argument('--sweep',           type=str,   default=None,
-                    help='Comma-separated eBOPs targets for sweep, e.g. "500,1000,1500,2000,3000"')
+                    help='Comma-separated eBOPs targets for sweep')
 parser.add_argument('--seed',            type=int,   default=42)
 parser.add_argument('--init_only',       action='store_true',
                     help='Only do Ramanujan init + save weights + plot graph, skip training')
 parser.add_argument('--skip_calib',      action='store_true',
-                    help='Skip calibration: start from high b_k and let budget controller compress')
+                    help='Skip calibration: start from high b_k')
 parser.add_argument('--calib_multiplier', type=float, default=1.0,
-                    help='Calibrate to target*multiplier eBOPs (e.g. 1.5 = calibrate 50%% above target)')
+                    help='Calibrate to target*multiplier eBOPs')
 parser.add_argument('--output_dir',      type=str, default='',
                     help='Optional output directory for a single-target run')
 args, _ = parser.parse_known_args()
@@ -140,7 +150,7 @@ batch_size   = 33200
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 工具函数
+# 工具函数（与 v2 相同）
 # ══════════════════════════════════════════════════════════════════════════════
 
 def set_all_beta(mdl, beta_value: float):
@@ -199,20 +209,15 @@ def compute_model_ebops(mdl, sample_input) -> float:
     return float(total)
 
 
-def make_lr_scheduler(lr_init, cycle, mmul):
+def make_lr_scheduler(lr_init, cycle, mmul, offset=0):
+    """offset: starting epoch offset so the schedule is phase-local."""
     fn = cosine_decay_restarts_schedule(lr_init, cycle, t_mul=1.0, m_mul=mmul,
                                         alpha=1e-6, alpha_steps=50)
-    return LearningRateScheduler(lambda epoch: fn(epoch))
+    return LearningRateScheduler(lambda epoch: fn(epoch - offset))
 
 
 def calibrate_kqb_to_target(model, sample_input, target_ebops, snapshots=None):
-    """校准 kq.b 使实际 eBOPs ≈ target_ebops。返回 (actual_ebops, snapshots)。
-
-    策略：
-    1. 收集所有活跃 kq.b（>0.05）的快照
-    2. 加 ±20% 噪声打破量化对齐
-    3. 二分搜索全局缩放因子
-    """
+    """校准 kq.b 使实际 eBOPs ≈ target_ebops。"""
     if snapshots is None:
         snapshots = []
         for layer in _flatten_layers(model):
@@ -225,8 +230,6 @@ def calibrate_kqb_to_target(model, sample_input, target_ebops, snapshots=None):
             if b_var is not None:
                 snapshots.append((b_var, b_var.numpy().copy()))
 
-
-        # 加噪声打破量化阶梯对齐
         rng = np.random.RandomState(42)
         for b_var, b_snap in snapshots:
             active = b_snap > 0.05
@@ -294,33 +297,34 @@ def print_ramanujan_topology_stats(mdl):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_single_target(target_ebops: float, cfg: dict):
-    """对单个 eBOPs 目标执行完整的 Ramanujan 初始化 + 两阶段训练。"""
+    """三阶段 Ramanujan 训练: Phase0 探索 → Phase1 压缩 → Phase2 精调。"""
 
     np.random.seed(cfg.get('seed', 42))
     random.seed(cfg.get('seed', 42))
 
+    phase0_epochs = cfg['phase0_epochs']
     phase1_epochs = cfg['phase1_epochs']
     phase2_epochs = cfg['phase2_epochs']
-    total_epochs  = phase1_epochs + phase2_epochs
+    total_epochs  = phase0_epochs + phase1_epochs + phase2_epochs
 
-    output_folder = cfg.get('output_dir', '') or f'results/ramanujan_v2_{int(target_ebops)}/'
+    output_folder = cfg.get('output_dir', '') or f'results/ramanujan_v3_{int(target_ebops)}/'
     if not cfg.get('output_dir', ''):
         if cfg.get('skip_calib', False):
-            output_folder = f'results/ramanujan_v2_{int(target_ebops)}_skipcalib_v2/'
+            output_folder = f'results/ramanujan_v3_{int(target_ebops)}_skipcalib/'
         elif cfg.get('calib_multiplier', 1.0) > 1.01:
             cm = cfg['calib_multiplier']
-            output_folder = f'results/ramanujan_v2_{int(target_ebops)}_cm{cm:.1f}/'
+            output_folder = f'results/ramanujan_v3_{int(target_ebops)}_cm{cm:.1f}/'
     os.makedirs(output_folder, exist_ok=True)
     device = get_tf_device()
 
     skip_calib = cfg.get('skip_calib', False)
 
     print('=' * 72)
-    print(f'  Ramanujan-Init v2  |  target_ebops = {target_ebops:.0f}')
-    if skip_calib:
-        print(f'  Mode: SKIP CALIB — start high, compress to target')
-    print(f'  Phase 1: {phase1_epochs} epochs, lr={cfg["phase1_lr"]:.1e}, margin=±{cfg["phase1_margin"]*100:.0f}%')
-    print(f'  Phase 2: {phase2_epochs} epochs, lr={cfg["phase2_lr"]:.1e}, margin=±{cfg["phase2_margin"]*100:.0f}%')
+    print(f'  Ramanujan-Init v3  |  target_ebops = {target_ebops:.0f}')
+    print(f'  ── v3 三阶段策略（探索 → 压缩 → 精调）──')
+    print(f'  Phase 0 (探索): {phase0_epochs} ep, lr={cfg["phase0_lr"]:.1e}, NO budget pressure')
+    print(f'  Phase 1 (压缩): {phase1_epochs} ep, lr={cfg["phase1_lr"]:.1e}, margin=±{cfg["phase1_margin"]*100:.0f}%')
+    print(f'  Phase 2 (精调): {phase2_epochs} ep, lr={cfg["phase2_lr"]:.1e}, margin=±{cfg["phase2_margin"]*100:.0f}%')
     print(f'  Ramanujan: mult={cfg["ram_multiplier"]}, min_degree={cfg["ram_min_degree"]}')
     print(f'  Output: {output_folder}')
     print('=' * 72)
@@ -328,21 +332,21 @@ def run_single_target(target_ebops: float, cfg: dict):
     t0 = time.time()
 
     # ── 1. 数据 ──────────────────────────────────────────────────────────────
-    print('\n[1/5] Loading dataset...')
+    print('\n[1/6] Loading dataset...')
     (X_train, y_train), (X_val, y_val), (X_test, y_test) = get_data(input_folder, src='openml')
     dataset_train = Dataset(X_train, y_train, batch_size, device, shuffle=True)
     dataset_val   = Dataset(X_val,   y_val,   batch_size, device)
     _sample = tf.constant(X_train[:min(2048, len(X_train))], dtype=tf.float32)
 
     # ── 2. 构建模型 ──────────────────────────────────────────────────────────
-    print(f'\n[2/5] Building HGQ model (init_bw_k={cfg["init_bw_k"]})...')
+    print(f'\n[2/6] Building HGQ model (init_bw_k={cfg["init_bw_k"]})...')
     model = get_model_hgq(init_bw_k=cfg['init_bw_k'], init_bw_a=3)
 
     init_ebops = compute_model_ebops(model, _sample)
     print(f'  Random-init eBOPs: {init_ebops:.0f}')
 
     # ── 3. Ramanujan 初始化 + 校准 ──────────────────────────────────────────
-    print(f'\n[3/5] Ramanujan BW-aware init → calibrate to {target_ebops:.0f} eBOPs...')
+    print(f'\n[3/6] Ramanujan BW-aware init → calibrate to {target_ebops:.0f} eBOPs...')
 
     per_layer_degree, per_layer_bk = compute_bw_aware_degree(
         model,
@@ -356,7 +360,7 @@ def run_single_target(target_ebops: float, cfg: dict):
         verbose=True,
     )
 
-    # 4-bit 初始化（更高起点给网络更多学习容量，配合 floor 保护防止连接死亡）
+    # 4-bit 初始化（高起点，给 Phase 0 探索更多容量）
     INIT_BK = 4.0
     apply_ramanujan_bw_init(
         model,
@@ -374,7 +378,7 @@ def run_single_target(target_ebops: float, cfg: dict):
     print(f'  After topology (b_k={INIT_BK}): eBOPs = {raw_ebops:.0f}')
     print_ramanujan_topology_stats(model)
 
-    # ── 3.5 保存校准前权重 + 绘制纯拓扑图（b_k=4.0，所有连接清晰可见）────
+    # 保存拓扑图
     pre_calib_path = os.path.join(output_folder, 'ramanujan_init_pre_calib.keras')
     model.save(pre_calib_path)
     print(f'  Pre-calibration weights saved: {pre_calib_path}')
@@ -388,22 +392,20 @@ def run_single_target(target_ebops: float, cfg: dict):
     print(f'  Ramanujan topology matrix: {topo_outputs["matrix_path"]}')
     print(f'  Ramanujan topology circle: {topo_outputs["circle_path"]}')
 
-    # 决定是否校准：skip_calib 模式从高位宽开始，让 budget controller 逐步压缩
-    skip_calib = cfg.get('skip_calib', False)
+    # 校准 b_k（Phase 0 探索时从 calibrated level 出发，而不是从高位宽压）
     if skip_calib:
         print(f'  [skip_calib] Starting from b_k={INIT_BK}, eBOPs={raw_ebops:.0f}.')
-        print(f'  Budget controller will compress {raw_ebops:.0f} → {target_ebops:.0f} during Phase 1.')
         start_ebops = raw_ebops
     else:
-        # 校准到 calib_multiplier × 目标
         calib_mult = cfg.get('calib_multiplier', 1.0)
         calib_target = target_ebops * calib_mult
         calib_ebops, _ = calibrate_kqb_to_target(model, _sample, calib_target)
-        print(f'  After calibration: eBOPs = {calib_ebops:.0f}  (calib_target = {calib_target:.0f}, final_target = {target_ebops:.0f})')
+        print(f'  After calibration: eBOPs = {calib_ebops:.0f}  '
+              f'(calib_target = {calib_target:.0f}, final_target = {target_ebops:.0f})')
         print_bk_stats(model, 'calibrated')
         start_ebops = calib_ebops
 
-    # ── 3.6 保存初始化权重 ──────────────────────────────────────────────────
+    # 保存初始化权重
     init_model_path = os.path.join(output_folder, 'ramanujan_init.keras')
     model.save(init_model_path)
     print(f'  Init weights saved: {init_model_path}')
@@ -411,66 +413,19 @@ def run_single_target(target_ebops: float, cfg: dict):
     if cfg.get('init_only', False):
         print(f'\n  [init_only] Done. Skipping training.')
         return {
-            'target_ebops':  target_ebops,
-            'start_ebops':   start_ebops,
-            'init_model':    init_model_path,
+            'target_ebops':    target_ebops,
+            'start_ebops':     start_ebops,
+            'init_model':      init_model_path,
             'pre_calib_model': pre_calib_path,
-            'matrix_plot':   str(topo_outputs['matrix_path']),
-            'circle_plot':   str(topo_outputs['circle_path']),
+            'matrix_plot':     str(topo_outputs['matrix_path']),
+            'circle_plot':     str(topo_outputs['circle_path']),
         }
 
-    # ── 4. Phase 1: 恢复训练 ─────────────────────────────────────────────────
-    print(f'\n[4/5] Phase 1: Recovery  ({phase1_epochs} epochs)')
-
-    set_all_beta(model, cfg['phase1_beta_init'])
-
-    # KQB Stabilizer: 锚定 kq.b 防止初期漂移
-    # skip_calib 模式不需要 stabilizer（b_k 很高，不怕漂移）
-    if skip_calib:
-        kqb_stab = None
-    else:
-        kqb_stab = KQBStabilizer(
-            hold_epochs=cfg['kqb_hold_epochs'],
-            release_epochs=cfg['kqb_release_epochs'],
-            hold_strength=cfg['kqb_hold_strength'],
-        )
-        kqb_stab.capture_snapshot(model)
-
-    # skip_calib 模式：从 4× 目标压缩，需要较强 beta 但配合 floor 保护
-    if skip_calib:
-        p1_beta_init = cfg.get('phase1_beta_init_skip', 1e-4)
-        p1_beta_max  = cfg.get('phase1_beta_max_skip', 2e-3)
-        p1_warmup    = 50
-    else:
-        p1_beta_init = cfg['phase1_beta_init']
-        p1_beta_max  = cfg['phase1_beta_max']
-        p1_warmup    = 100
-
-    phase1_budget_ctrl = BetaOnlyBudgetController(
-        target_ebops    = target_ebops,
-        margin          = cfg['phase1_margin'],
-        beta_init       = p1_beta_init,
-        beta_min        = cfg['phase1_beta_min'],
-        beta_max        = p1_beta_max,
-        adjust_factor   = 1.15,
-        ema_alpha       = 0.25,
-        warmup_epochs   = p1_warmup,
-        max_change_ratio = 1.5,
-        init_ebops      = start_ebops,
-    )
-
-    # Mask enforcer: 起点高于目标时保护拓扑，逐步释放
+    # ── mask enforcer 贯穿三阶段 ──────────────────────────────────────────
+    # mask_hold 默认涵盖 Phase 0 全程 + Phase 1 全程，Phase 2 开始后 fade
+    mask_hold = cfg.get('mask_hold', phase0_epochs + phase1_epochs)
+    mask_fade = cfg.get('mask_fade', 2000)
     use_floor = skip_calib or cfg.get('calib_multiplier', 1.0) > 1.01
-    if skip_calib:
-        mask_hold = cfg.get('mask_hold_skip', 2000)
-        mask_fade = cfg.get('mask_fade_skip', 3000)
-    elif use_floor:
-        # calib_multiplier > 1: 校准略高于目标，温和保护
-        mask_hold = cfg.get('mask_hold', min(2000, phase1_epochs))
-        mask_fade = cfg.get('mask_fade', 3000)
-    else:
-        mask_hold = cfg.get('mask_hold', phase1_epochs)
-        mask_fade = cfg.get('mask_fade', 3000)
     mask_enforcer = RamanujanMaskEnforcer(
         release_epoch=mask_hold,
         fade_epochs=mask_fade,
@@ -491,6 +446,72 @@ def run_single_target(target_ebops: float, cfg: dict):
         beta_callback=None,
     )
 
+    # ── 4. Phase 0: 拓扑探索（无 budget 压力）──────────────────────────────
+    print(f'\n[4/6] Phase 0: Topology Exploration  ({phase0_epochs} epochs)')
+    print(f'  ▸ beta ≈ 0, mask固定, 让模型在稀疏拓扑下充分收敛')
+    print(f'  ▸ 当前 eBOPs={start_ebops:.0f}, 不压缩到 {target_ebops:.0f}')
+
+    # beta 设为近零：无位宽压力
+    set_all_beta(model, 1e-12)
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=cfg['phase0_lr']),
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=['accuracy'],
+        steps_per_execution=32,
+    )
+
+    phase0_callbacks = [
+        ebops_cb,
+        # ★ 无 BudgetController —— Phase 0 不压缩 eBOPs ★
+        mask_enforcer,        # mask 完全固定（release_epoch 远未到）
+        pareto_cb,
+        make_lr_scheduler(cfg['phase0_lr'], cfg['phase0_lr_cycle'], cfg['phase0_lr_mmul'],
+                          offset=0),
+        trace_cb,
+    ]
+
+    model.fit(
+        dataset_train,
+        validation_data=dataset_val,
+        epochs=phase0_epochs,
+        callbacks=phase0_callbacks,
+        verbose=1,
+    )
+
+    phase0_ebops = compute_model_ebops(model, _sample)
+    phase0_res = model.evaluate(dataset_val, verbose=0)
+    print(f'\n  Phase 0 done:  val_acc={phase0_res[1]:.4f}  eBOPs={phase0_ebops:.0f}  (target={target_ebops:.0f})')
+    print_bk_stats(model, 'end of Phase 0')
+
+    # ── 5. Phase 1: eBOPs 压缩 ──────────────────────────────────────────────
+    print(f'\n[5/6] Phase 1: eBOPs Compression  ({phase1_epochs} epochs)')
+    print(f'  ▸ 从 {phase0_ebops:.0f} 逐步压缩至 {target_ebops:.0f} eBOPs')
+
+    # KQB Stabilizer：防止压缩初期 b_k 暴跌
+    if not skip_calib:
+        kqb_stab = KQBStabilizer(
+            hold_epochs=cfg['kqb_hold_epochs'],
+            release_epochs=cfg['kqb_release_epochs'],
+            hold_strength=cfg['kqb_hold_strength'],
+        )
+        kqb_stab.capture_snapshot(model)
+    else:
+        kqb_stab = None
+
+    phase1_budget_ctrl = BetaOnlyBudgetController(
+        target_ebops     = target_ebops,
+        margin           = cfg['phase1_margin'],
+        beta_init        = cfg['phase1_beta_init'],
+        beta_min         = cfg['phase1_beta_min'],
+        beta_max         = cfg['phase1_beta_max'],
+        adjust_factor    = 1.15,
+        ema_alpha        = 0.25,
+        warmup_epochs    = 100,        # 短暂 warmup，避免突然施压
+        max_change_ratio = 1.5,
+        init_ebops       = phase0_ebops,   # 从 Phase 0 结束时的 eBOPs 出发
+    )
+
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=cfg['phase1_lr']),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
@@ -500,20 +521,21 @@ def run_single_target(target_ebops: float, cfg: dict):
 
     phase1_callbacks = [
         ebops_cb,
-        phase1_budget_ctrl,
-        mask_enforcer,        # 保护 Ramanujan 拓扑
+        phase1_budget_ctrl,   # ★ 开始压缩 ★
+        mask_enforcer,        # mask 仍然固定（release_epoch 未到）
         pareto_cb,
-        make_lr_scheduler(cfg['phase1_lr'], cfg['phase1_lr_cycle'], cfg['phase1_lr_mmul']),
+        make_lr_scheduler(cfg['phase1_lr'], cfg['phase1_lr_cycle'], cfg['phase1_lr_mmul'],
+                          offset=phase0_epochs),
         trace_cb,
     ]
     if kqb_stab is not None:
-        phase1_callbacks.insert(2, kqb_stab)  # 稳定 kq.b
+        phase1_callbacks.insert(2, kqb_stab)
 
-    print(f'  Starting Phase 1...')
     model.fit(
         dataset_train,
         validation_data=dataset_val,
-        epochs=phase1_epochs,
+        initial_epoch=phase0_epochs,
+        epochs=phase0_epochs + phase1_epochs,
         callbacks=phase1_callbacks,
         verbose=1,
     )
@@ -525,24 +547,24 @@ def run_single_target(target_ebops: float, cfg: dict):
           f'beta={phase1_beta:.2e}')
     print_bk_stats(model, 'end of Phase 1')
 
-    # ── 5. Phase 2: 精调 ─────────────────────────────────────────────────────
-    print(f'\n[5/5] Phase 2: Accuracy maximization  ({phase2_epochs} epochs)')
-    print(f'  Recompiling with fresh Adam optimizer...')
+    # ── 6. Phase 2: 精调 ─────────────────────────────────────────────────────
+    print(f'\n[6/6] Phase 2: Accuracy Fine-tuning  ({phase2_epochs} epochs)')
+    print(f'  ▸ 低 LR, 窄 margin(±{cfg["phase2_margin"]*100:.0f}%), mask 逐渐释放, Adam 重置')
 
     phase2_budget_ctrl = BetaOnlyBudgetController(
-        target_ebops    = target_ebops,
-        margin          = cfg['phase2_margin'],    # 窄 margin
-        beta_init       = phase1_beta,             # 继承 Phase 1 的均衡 beta
-        beta_min        = cfg['phase2_beta_min'],
-        beta_max        = cfg['phase2_beta_max'],
-        adjust_factor   = 1.15,
-        ema_alpha       = 0.15,                    # 更平滑
-        warmup_epochs   = 0,                       # 不需要 warmup
+        target_ebops     = target_ebops,
+        margin           = cfg['phase2_margin'],
+        beta_init        = phase1_beta,
+        beta_min         = cfg['phase2_beta_min'],
+        beta_max         = cfg['phase2_beta_max'],
+        adjust_factor    = 1.15,
+        ema_alpha        = 0.15,
+        warmup_epochs    = 0,
         max_change_ratio = 1.5,
-        init_ebops      = target_ebops,
+        init_ebops       = target_ebops,
     )
 
-    # 重新编译（重置 Adam momentum，避免 Phase 1 的惯性干扰 Phase 2 精调）
+    # 重置 Adam momentum
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=cfg['phase2_lr']),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
@@ -555,17 +577,18 @@ def run_single_target(target_ebops: float, cfg: dict):
         ebops_budget         = earlystop_budget,
         patience             = cfg['earlystop_patience'],
         min_delta            = 5e-5,
-        min_epoch            = phase1_epochs + 1000,
+        min_epoch            = phase0_epochs + phase1_epochs + 1000,
         restore_best_weights = True,
     )
 
-    # Phase 2: mask enforcer 继续（fade 会在 Phase 2 逐渐放开或已经完全放开）
+    # mask_enforcer 在 Phase 2 开始时进入 fade 阶段（因 release_epoch 已到）
     phase2_callbacks = [
         ebops_cb,
         phase2_budget_ctrl,
-        mask_enforcer,        # fade 继续，直到完全放开
+        mask_enforcer,        # Phase 2 期间 fade 释放
         pareto_cb,
-        make_lr_scheduler(cfg['phase2_lr'], cfg['phase2_lr_cycle'], cfg['phase2_lr_mmul']),
+        make_lr_scheduler(cfg['phase2_lr'], cfg['phase2_lr_cycle'], cfg['phase2_lr_mmul'],
+                          offset=phase0_epochs + phase1_epochs),
         trace_cb,
         early_stop_cb,
     ]
@@ -573,7 +596,7 @@ def run_single_target(target_ebops: float, cfg: dict):
     model.fit(
         dataset_train,
         validation_data=dataset_val,
-        initial_epoch=phase1_epochs,
+        initial_epoch=phase0_epochs + phase1_epochs,
         epochs=total_epochs,
         callbacks=phase2_callbacks,
         verbose=1,
@@ -591,6 +614,8 @@ def run_single_target(target_ebops: float, cfg: dict):
         'final_ebops':    final_ebops,
         'final_val_acc':  float(final_res[1]),
         'final_val_loss': float(final_res[0]),
+        'phase0_val_acc': float(phase0_res[1]),
+        'phase0_ebops':   phase0_ebops,
         'phase1_val_acc': float(phase1_res[1]),
         'phase1_ebops':   phase1_ebops,
         'elapsed_sec':    elapsed,
@@ -607,7 +632,6 @@ def run_single_target(target_ebops: float, cfg: dict):
             result['best_val_acc'] = float(va.max())
             result['best_epoch']   = int(va.argmax())
             result['best_ebops']   = float(eb[va.argmax()])
-            # 条件筛选：eBOPs ≤ 1.1× target 时的最佳
             mask = eb <= target_ebops * 1.1
             if mask.any():
                 filtered = np.where(mask, va, 0)
@@ -616,12 +640,14 @@ def run_single_target(target_ebops: float, cfg: dict):
                 result['best_epoch_in_budget'] = int(best_filtered)
 
     print(f'\n  {"=" * 60}')
-    print(f'  target={target_ebops:.0f}  final_ebops={final_ebops:.0f}  '
-          f'val_acc={final_res[1]:.4f}  best_acc={result.get("best_val_acc", 0):.4f}  '
-          f'time={elapsed:.0f}s')
+    print(f'  v3 Result:')
+    print(f'    phase0_acc={phase0_res[1]:.4f} (at eBOPs={phase0_ebops:.0f}, no compression)')
+    print(f'    phase1_acc={phase1_res[1]:.4f} (after compression to eBOPs={phase1_ebops:.0f})')
+    print(f'    final_acc={final_res[1]:.4f}   best_acc={result.get("best_val_acc", 0):.4f}')
+    print(f'    best_in_budget={result.get("best_acc_in_budget", 0):.4f}')
+    print(f'    target={target_ebops:.0f}  final_ebops={final_ebops:.0f}  time={elapsed:.0f}s')
     print(f'  {"=" * 60}')
 
-    # 保存结果摘要
     summary_path = os.path.join(output_folder, 'result_summary.json')
     with open(summary_path, 'w') as f:
         json.dump(result, f, indent=2)
@@ -636,29 +662,31 @@ def run_single_target(target_ebops: float, cfg: dict):
 
 if __name__ == '__main__':
 
-    # 构建配置 dict
     cfg = dict(DEFAULT_CONFIG)
-    cfg['seed'] = args.seed
-    cfg['target_ebops']   = args.target_ebops
-    cfg['phase1_epochs']  = args.phase1_epochs
-    cfg['phase2_epochs']  = args.phase2_epochs
-    cfg['phase1_lr']      = args.phase1_lr
-    cfg['phase2_lr']      = args.phase2_lr
-    cfg['init_bw_k']      = args.init_bw_k
-    cfg['ram_multiplier'] = args.ram_multiplier
-    cfg['ram_min_degree'] = args.ram_min_degree
-    cfg['mask_hold']      = args.mask_hold if args.mask_hold is not None else args.phase1_epochs
-    cfg['mask_fade']      = args.mask_fade
-    cfg['init_only']      = args.init_only
-    cfg['skip_calib']     = args.skip_calib
+    cfg['seed']            = args.seed
+    cfg['target_ebops']    = args.target_ebops
+    cfg['phase0_epochs']   = args.phase0_epochs
+    cfg['phase1_epochs']   = args.phase1_epochs
+    cfg['phase2_epochs']   = args.phase2_epochs
+    cfg['phase0_lr']       = args.phase0_lr
+    cfg['phase1_lr']       = args.phase1_lr
+    cfg['phase2_lr']       = args.phase2_lr
+    cfg['init_bw_k']       = args.init_bw_k
+    cfg['ram_multiplier']  = args.ram_multiplier
+    cfg['ram_min_degree']  = args.ram_min_degree
+    cfg['mask_hold']       = (args.mask_hold if args.mask_hold is not None
+                              else args.phase0_epochs + args.phase1_epochs)
+    cfg['mask_fade']       = args.mask_fade
+    cfg['init_only']       = args.init_only
+    cfg['skip_calib']      = args.skip_calib
     cfg['calib_multiplier'] = args.calib_multiplier
-    cfg['output_dir']     = args.output_dir
+    cfg['output_dir']      = args.output_dir
 
     if args.sweep:
         # ── Sweep 模式 ───────────────────────────────────────────────────────
         targets = [float(x.strip()) for x in args.sweep.split(',')]
         print(f'\n{"#" * 72}')
-        print(f'  Ramanujan v2 — eBOPs SWEEP:  {targets}')
+        print(f'  Ramanujan v3 — eBOPs SWEEP:  {targets}')
         print(f'{"#" * 72}\n')
 
         all_results = []
@@ -667,7 +695,6 @@ if __name__ == '__main__':
             result = run_single_target(t, cfg_copy)
             all_results.append(result)
 
-            # 打印累积 Pareto
             print(f'\n  ── Sweep progress (Pareto so far) ──')
             for r in sorted(all_results, key=lambda x: x['target_ebops']):
                 print(f'    target={r["target_ebops"]:6.0f}  '
@@ -676,15 +703,13 @@ if __name__ == '__main__':
                       f'final_ebops={r["final_ebops"]:.0f}')
             print()
 
-        # 保存 sweep 汇总
-        sweep_summary_path = 'results/ramanujan_v2_sweep_summary.json'
+        sweep_summary_path = 'results/ramanujan_v3_sweep_summary.json'
         with open(sweep_summary_path, 'w') as f:
             json.dump(all_results, f, indent=2)
         print(f'\nSweep summary saved: {sweep_summary_path}')
 
-        # 最终 Pareto 表
         print(f'\n{"=" * 72}')
-        print(f'  Ramanujan v2 Sweep — Final Pareto')
+        print(f'  Ramanujan v3 Sweep — Final Pareto')
         print(f'  {"target":>8s}  {"best_acc":>8s}  {"in_budget":>9s}  {"final_eb":>8s}  {"time":>6s}')
         print(f'  {"-" * 50}')
         for r in sorted(all_results, key=lambda x: x['target_ebops']):

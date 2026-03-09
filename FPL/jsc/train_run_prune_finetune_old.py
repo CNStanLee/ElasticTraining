@@ -14,6 +14,7 @@ import tensorflow as tf
 
 from data.data import get_data
 import model.model  # noqa: F401  # 注册自定义层
+from model.model import get_model_hgq
 from hgq.layers import QLayerBase
 from hgq.utils.sugar import Dataset, FreeEBOPs, ParetoFront
 from keras.callbacks import LearningRateScheduler
@@ -25,11 +26,17 @@ from utils.ramanujan_budget_utils import (
     HighBitPruner,
     SensitivityAwarePruner,
     BetaOnlyBudgetController,
+    KQBStabilizer,
+    compute_bw_aware_degree,
+    apply_ramanujan_bw_init,
     _flatten_layers,
     _get_kq_var,
 )
+from utils.ramaujian_utils import RamanujanMaskEnforcer
+from utils.topology_graph_plot_utils import LayerGraphData, TopologyGraphPlotter
 from run_one_shot_prune_only import (
     saliency_prune_to_ebops,
+    spectral_path_prune_to_ebops,
     spectral_quant_prune_to_ebops,
     snows_prune_to_ebops,
     bisect_ebops_to_target,
@@ -51,6 +58,25 @@ BASELINE_EBOPS = 19899
 
 TARGET_EBOPS = 1000
 
+# Ramanujan init v2 tuned defaults (kept separate to avoid polluting other branches)
+DEFAULT_INIT_CALIB_MULT = 1.10   # legacy for random_init; Ramanujan branch overrides to 1.0
+RAM_CALIB_DEFAULT     = 1.00
+RAM_P1_BETA_INIT      = 5e-7
+RAM_P1_BETA_MIN       = 1e-8
+RAM_P1_BETA_MAX       = 2e-4
+RAM_P1_MARGIN         = 0.20
+RAM_P1_ADJUST         = 1.15
+RAM_P1_EMA            = 0.25
+RAM_P1_WARMUP         = 100
+RAM_P1_MAX_CHANGE     = 1.50
+RAM_P2_MARGIN         = 0.05
+RAM_P2_BETA_MIN       = 1e-7
+RAM_P2_BETA_MAX       = 5e-4
+RAM_P2_ADJUST         = 1.15
+RAM_P2_EMA            = 0.15
+RAM_P2_WARMUP         = 0
+RAM_P2_MAX_CHANGE     = 1.50
+
 # ── 剪枝方式 ──────────────────────────────────────────────────────────────────
 # 'uniform'        : 旧方案 HighBitPruner (均匀缩放，有精度损失)
 # 'sensitivity'    : 按层敏感度分配预算
@@ -58,8 +84,11 @@ TARGET_EBOPS = 1000
 # 'grasp'          : 梯度流保持的 Hessian-gradient saliency
 # 'synflow'        : data-free synaptic flow saliency
 # 'spectral_quant' : 谱/拓扑友好剪枝（低预算会自动走结构化子网络）
+# 'spectral_path'  : 在 spectral_quant 上加入端到端路径连通性约束
 # 'snows'          : sensitivity/spectral warm-start + Hessian-free K-step representation reconstruction
-PRUNE_METHOD = 'snows'
+# 'random_init'    : 随机初始化 + kq.b 校准到预算附近
+# 'ramanujan_init' : Ramanujan 拓扑初始化 + kq.b 校准到预算附近
+PRUNE_METHOD = 'spectral_quant'
 
 input_folder = 'data/dataset.h5'
 batch_size   = 33200
@@ -108,7 +137,9 @@ parser.add_argument('--phase1_epochs', type=int,   default=PHASE1_EPOCHS)
 parser.add_argument('--phase2_epochs', type=int,   default=PHASE2_EPOCHS)
 parser.add_argument('--checkpoint',    type=str,   default=BASELINE_CKPT)
 parser.add_argument('--prune_method',  type=str,   default=PRUNE_METHOD,
-                    choices=['uniform', 'sensitivity', 'snip', 'grasp', 'synflow', 'spectral_quant', 'snows'])
+                    choices=['uniform', 'sensitivity', 'snip', 'grasp', 'synflow', 'spectral_quant', 'spectral_path', 'snows', 'random_init', 'ramanujan_init'])
+parser.add_argument('--output_dir',    type=str,   default='',
+                    help='Optional output directory. Defaults to results/prune_finetune_{target}/')
 parser.add_argument('--auto_warm_start', action='store_true', default=True,
                     help='Auto pick a near-budget warm-start checkpoint for low-budget training')
 parser.add_argument('--no_auto_warm_start', action='store_true',
@@ -134,6 +165,18 @@ parser.add_argument('--snows_cg_iters', type=int, default=25,
                     help='Maximum conjugate-gradient iterations for SNOWS')
 parser.add_argument('--snows_damping', type=float, default=1e-4,
                     help='SNOWS Hessian-free damping')
+parser.add_argument('--init_bw_k', type=int, default=3,
+                    help='Initial kernel bitwidth for random/ramanujan initialization branches')
+parser.add_argument('--init_calib_multiplier', type=float, default=DEFAULT_INIT_CALIB_MULT,
+                    help='Calibrate fresh-init models to target * multiplier eBOPs before training')
+parser.add_argument('--ram_multiplier', type=float, default=1.5,
+                    help='Ramanujan degree multiplier')
+parser.add_argument('--ram_min_degree', type=int, default=4,
+                    help='Minimum Ramanujan per-layer degree')
+parser.add_argument('--ram_mask_hold', type=int, default=None,
+                    help='Epochs to hold Ramanujan mask before release (default: phase1_epochs)')
+parser.add_argument('--ram_mask_fade', type=int, default=3000,
+                    help='Fade epochs for Ramanujan mask release')
 args, _ = parser.parse_known_args()
 
 TARGET_EBOPS    = args.target_ebops
@@ -142,6 +185,10 @@ PHASE2_EPOCHS   = args.phase2_epochs
 BASELINE_CKPT   = args.checkpoint
 PRUNE_METHOD    = args.prune_method
 EARLYSTOP_BUDGET = TARGET_EBOPS * 1.5
+# Ramanujan init v2 使用 1.0× 校准；保持 random_init 旧默认 1.10×
+ram_calib_multiplier = args.init_calib_multiplier
+if PRUNE_METHOD == 'ramanujan_init' and args.init_calib_multiplier == DEFAULT_INIT_CALIB_MULT:
+    ram_calib_multiplier = RAM_CALIB_DEFAULT
 if args.no_auto_warm_start:
     args.auto_warm_start = False
 if args.no_functional_calibrate:
@@ -200,7 +247,7 @@ BASELINE_CKPT, warm_start_msg = _choose_warm_start_ckpt(
     max_ratio=args.warm_start_max_ratio,
 )
 
-output_folder = f'results/prune_finetune_{int(TARGET_EBOPS)}/'
+output_folder = args.output_dir or f'results/prune_finetune_{int(TARGET_EBOPS)}/'
 device = get_tf_device()
 os.makedirs(output_folder, exist_ok=True)
 
@@ -380,6 +427,152 @@ def correct_pruning_ebops(
     return final_e
 
 
+def calibrate_kqb_to_target(
+    model,
+    sample_input,
+    target_ebops: float,
+    noise_low: float = 0.8,
+    noise_high: float = 1.2,
+    active_threshold: float = 0.05,
+    lo: float = 0.005,
+    hi: float = 5.0,
+    max_iter: int = 50,
+):
+    """Uniformly rescale active kq.b with de-alignment noise to hit a target EBOPs."""
+    snapshots = []
+    for layer in _flatten_layers(model):
+        kq = getattr(layer, 'kq', None)
+        if kq is None:
+            continue
+        b_var = _get_kq_var(kq, 'b')
+        if b_var is None:
+            b_var = _get_kq_var(kq, 'f')
+        if b_var is not None:
+            snapshots.append((b_var, b_var.numpy().copy()))
+
+    if not snapshots:
+        return compute_model_ebops(model, sample_input)
+
+    rng = np.random.RandomState(42)
+    noisy_snapshots = []
+    for b_var, b_snap in snapshots:
+        active = b_snap > active_threshold
+        noise = rng.uniform(noise_low, noise_high, size=b_snap.shape).astype(np.float32)
+        b_noisy = np.where(active, b_snap * noise, b_snap)
+        b_var.assign(b_noisy.astype(np.float32))
+        noisy_snapshots.append((b_var, b_var.numpy().copy()))
+
+    def _apply_scale(scale: float):
+        for b_var, b_snap in noisy_snapshots:
+            active = b_snap > active_threshold
+            b_new = np.where(active, (b_snap * scale).clip(0.1, 8.0), b_snap)
+            b_var.assign(b_new.astype(np.float32))
+
+    def _measure(scale: float) -> float:
+        _apply_scale(scale)
+        return compute_model_ebops(model, sample_input)
+
+    current_ebops = _measure(1.0)
+    best_scale, best_ebops = 1.0, current_ebops
+    best_err = abs(current_ebops - target_ebops)
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2.0
+        ebops = _measure(mid)
+        err = abs(ebops - target_ebops)
+        if err < best_err:
+            best_scale, best_ebops, best_err = mid, ebops, err
+        if err / max(target_ebops, 1.0) < 0.03:
+            best_scale, best_ebops = mid, ebops
+            break
+        if ebops > target_ebops:
+            hi = mid
+        else:
+            lo = mid
+
+    _apply_scale(best_scale)
+    return compute_model_ebops(model, sample_input)
+
+
+def save_init_artifacts(
+    model,
+    output_folder: str,
+    stem: str,
+    title: str,
+    sample_input,
+):
+    """Save current model weights and plot its topology before training."""
+    init_dir = Path(output_folder) / 'init_graph'
+    init_dir.mkdir(parents=True, exist_ok=True)
+    model_path = Path(output_folder) / f'{stem}.keras'
+    model.save(model_path)
+
+    measured_ebops = compute_model_ebops(model, sample_input)
+    subtitle = f'ebops={measured_ebops:.0f}'
+    plotter = TopologyGraphPlotter(
+        symmetric_topology_plot=False,
+        mirror_edges=False,
+        plot_matrix=True,
+    )
+    layers = plotter.extract_layer_graph_data(model)
+    matrix_path = init_dir / f'{stem}_weighted_topology_matrix.png'
+    circle_path = init_dir / f'{stem}_weighted_circle_graph.png'
+    plotter.plot_weighted_topology_matrices(layers, matrix_path, title=title, subtitle=subtitle)
+    plotter.plot_circle_graph(layers, circle_path, title=title, subtitle=subtitle)
+    return {
+        'model_path': str(model_path),
+        'matrix_path': str(matrix_path),
+        'circle_path': str(circle_path),
+        'ebops': measured_ebops,
+    }
+
+
+def save_ramanujan_mask_artifacts(
+    model,
+    output_folder: str,
+    stem: str,
+    title: str,
+    sample_input,
+):
+    """Plot the exact Ramanujan mask instead of weight-magnitude-weighted edges."""
+    init_dir = Path(output_folder) / 'init_graph'
+    init_dir.mkdir(parents=True, exist_ok=True)
+
+    layers = []
+    for layer in _flatten_layers(model):
+        mask = getattr(layer, 'ramanujan_mask', None)
+        if mask is None:
+            continue
+        m = np.array(mask.numpy(), dtype=np.float32)
+        if m.ndim < 2:
+            continue
+        layers.append(
+            LayerGraphData(
+                name=layer.name,
+                bit_matrix=m,
+                weighted_matrix=m,
+            )
+        )
+    if not layers:
+        return None
+
+    measured_ebops = compute_model_ebops(model, sample_input)
+    subtitle = f'ebops={measured_ebops:.0f} | exact ramanujan mask'
+    plotter = TopologyGraphPlotter(
+        symmetric_topology_plot=False,
+        mirror_edges=False,
+        plot_matrix=True,
+    )
+    matrix_path = init_dir / f'{stem}_weighted_topology_matrix.png'
+    circle_path = init_dir / f'{stem}_weighted_circle_graph.png'
+    plotter.plot_weighted_topology_matrices(layers, matrix_path, title=title, subtitle=subtitle)
+    plotter.plot_circle_graph(layers, circle_path, title=title, subtitle=subtitle)
+    return {
+        'matrix_path': str(matrix_path),
+        'circle_path': str(circle_path),
+        'ebops': measured_ebops,
+    }
+
+
 def make_lr_scheduler(lr_init, cycle, mmul, offset=0):
     """构造 LearningRateScheduler，offset 用于 phase2（epoch 从 PHASE1_EPOCHS 开始）。"""
     fn = cosine_decay_restarts_schedule(lr_init, cycle, t_mul=1.0, m_mul=mmul,
@@ -405,10 +598,14 @@ class ConstantBetaCallback(keras.callbacks.Callback):
 
 if __name__ == '__main__':
     TOTAL_EPOCHS = PHASE1_EPOCHS + PHASE2_EPOCHS
+    init_only_methods = {'random_init', 'ramanujan_init'}
 
     print('=' * 65)
     print(f'  One-shot Prune + Two-phase Finetune')
-    print(f'  Source      : {BASELINE_CKPT}')
+    if PRUNE_METHOD in init_only_methods:
+        print(f'  Source      : fresh model initialization')
+    else:
+        print(f'  Source      : {BASELINE_CKPT}')
     if warm_start_msg:
         print(f'  Warm-start  : {warm_start_msg}')
     print(f'  Target      : ebops = {TARGET_EBOPS}')
@@ -433,23 +630,120 @@ if __name__ == '__main__':
     _sample_input = tf.constant(X_val[:512], dtype=tf.float32)
 
     # ── 2. 加载最优权重 ──────────────────────────────────────────────────────
-    print(f'\n[2/5] Loading checkpoint: {BASELINE_CKPT}')
-    teacher_model = keras.models.load_model(BASELINE_CKPT, compile=False)
-    model = keras.models.load_model(BASELINE_CKPT, compile=False)
-    model.summary()
-    print_bk_stats(model, 'before pruning')
+    teacher_model = None
+    ramanujan_mask_enforcer = None
+    ramanujan_kqb_stabilizer = None
+    ramanujan_init_report = None
+    random_init_report = None
+    if PRUNE_METHOD in init_only_methods:
+        print(f'\n[2/5] Building fresh HGQ model (init_bw_k={args.init_bw_k})')
+        model = get_model_hgq(init_bw_k=args.init_bw_k, init_bw_a=3)
+        model.summary()
+        print_bk_stats(model, 'fresh init')
+        actual_baseline_ebops = compute_model_ebops(model, _sample_input)
+        print(f'  Fresh-init EBOPs (measured): {actual_baseline_ebops:.1f}')
+    else:
+        print(f'\n[2/5] Loading checkpoint: {BASELINE_CKPT}')
+        teacher_model = keras.models.load_model(BASELINE_CKPT, compile=False)
+        model = keras.models.load_model(BASELINE_CKPT, compile=False)
+        model.summary()
+        print_bk_stats(model, 'before pruning')
 
-    # 实测加载后的 EBOPs（不依赖文件名中的硬编码值）
-    actual_baseline_ebops = compute_model_ebops(model, _sample_input)
-    print(f'  Actual baseline EBOPs (measured): {actual_baseline_ebops:.1f}  '
-          f'(hardcoded ref: {BASELINE_EBOPS})')
+        # 实测加载后的 EBOPs（不依赖文件名中的硬编码值）
+        actual_baseline_ebops = compute_model_ebops(model, _sample_input)
+        print(f'  Actual baseline EBOPs (measured): {actual_baseline_ebops:.1f}  '
+              f'(hardcoded ref: {BASELINE_EBOPS})')
 
     # ── 3. 一次性位宽剪枝 ────────────────────────────────────────────────────
-    print(f'\n[3/5] One-shot bit-width pruning ({PRUNE_METHOD}): '
+    stage_label = 'Initialization' if PRUNE_METHOD in init_only_methods else 'One-shot bit-width pruning'
+    print(f'\n[3/5] {stage_label} ({PRUNE_METHOD}): '
           f'{actual_baseline_ebops:.1f} -> {TARGET_EBOPS}')
     used_structured_low_budget = False
     snows_report = None
-    if PRUNE_METHOD == 'sensitivity':
+    spectral_path_report = None
+    ramanujan_precalib_report = None
+    if PRUNE_METHOD == 'random_init':
+        calib_target = TARGET_EBOPS * args.init_calib_multiplier
+        post_prune_ebops = calibrate_kqb_to_target(
+            model,
+            _sample_input,
+            calib_target,
+            noise_low=0.7,
+            noise_high=1.3,
+        )
+        print(f'  Random-init calibration: target={calib_target:.1f}  actual={post_prune_ebops:.1f}')
+        random_init_report = save_init_artifacts(
+            model,
+            output_folder=output_folder,
+            stem='random_init_start',
+            title='Random Init Start Topology',
+            sample_input=_sample_input,
+        )
+        print(f'  Random-init graph: {random_init_report["circle_path"]}')
+    elif PRUNE_METHOD == 'ramanujan_init':
+        per_layer_degree, _ = compute_bw_aware_degree(
+            model,
+            target_ebops=TARGET_EBOPS,
+            b_a_init=3.0,
+            b_k_min=0.5,
+            b_k_max=8.0,
+            multiplier=args.ram_multiplier,
+            min_degree=args.ram_min_degree,
+            budget_weight='capacity',
+            verbose=True,
+        )
+        apply_ramanujan_bw_init(
+            model,
+            per_layer_degree=per_layer_degree,
+            per_layer_bk={name: 4.0 for name in per_layer_degree},
+            seed=42,
+            pruned_frac_bits=0.0,
+            pruned_int_bits=0.0,
+            active_int_bits=1.0,
+            also_zero_kernel=True,
+            verbose=True,
+        )
+        raw_ramanujan_ebops = compute_model_ebops(model, _sample_input)
+        print(f'  Ramanujan topology init EBOPs: {raw_ramanujan_ebops:.1f}')
+        ramanujan_precalib_report = save_ramanujan_mask_artifacts(
+            model,
+            output_folder=output_folder,
+            stem='ramanujan_init_pre_calib',
+            title='Ramanujan Init Exact Mask Topology',
+            sample_input=_sample_input,
+        )
+        if ramanujan_precalib_report is not None:
+            print(f'  Ramanujan pre-calib mask graph: {ramanujan_precalib_report["circle_path"]}')
+        post_prune_ebops = calibrate_kqb_to_target(
+            model,
+            _sample_input,
+            TARGET_EBOPS * ram_calib_multiplier,
+        )
+        print(f'  Ramanujan calibrated start EBOPs: {post_prune_ebops:.1f} '
+              f'(mult={ram_calib_multiplier:.2f}×)')
+        ramanujan_init_report = save_init_artifacts(
+            model,
+            output_folder=output_folder,
+            stem='ramanujan_init_start',
+            title='Ramanujan Init Start Topology',
+            sample_input=_sample_input,
+        )
+        print(f'  Ramanujan init graph: {ramanujan_init_report["circle_path"]}')
+        ramanujan_kqb_stabilizer = KQBStabilizer(
+            hold_epochs=50,
+            release_epochs=200,
+            hold_strength=0.8,
+        )
+        ramanujan_kqb_stabilizer.capture_snapshot(model)
+        ramanujan_mask_enforcer = RamanujanMaskEnforcer(
+            release_epoch=(
+                args.ram_mask_hold if args.ram_mask_hold is not None
+                else (min(2000, PHASE1_EPOCHS) if ram_calib_multiplier > 1.01 else PHASE1_EPOCHS)
+            ),
+            fade_epochs=args.ram_mask_fade,
+            min_active_frac_bits=1.0 if ram_calib_multiplier > 1.01 else None,
+        )
+    elif PRUNE_METHOD == 'sensitivity':
         pruner = SensitivityAwarePruner(target_ebops=TARGET_EBOPS, pruned_threshold=0.1, b_k_min=0.3)
         pruner.prune_to_ebops(model, current_ebops=actual_baseline_ebops, verbose=True)
     elif PRUNE_METHOD == 'uniform':
@@ -481,6 +775,19 @@ if __name__ == '__main__':
             verbose=True,
         )
         used_structured_low_budget = bool(snows_report.get('used_structured_low_budget', False))
+    elif PRUNE_METHOD == 'spectral_path':
+        _, spectral_path_report = spectral_path_prune_to_ebops(
+            model,
+            target_ebops=TARGET_EBOPS,
+            sample_input=_sample_input,
+            min_degree=2,
+            min_hidden_width=4,
+            b_floor=0.35,
+            near_budget_ratio=1.6,
+            high_budget_ratio=0.45,
+            verbose=True,
+        )
+        used_structured_low_budget = True
     else:
         _, used_structured_low_budget = spectral_quant_prune_to_ebops(
             model,
@@ -494,11 +801,12 @@ if __name__ == '__main__':
             near_budget_ratio=1.6,
             verbose=True,
         )
-    print_bk_stats(model, 'after pruning')
+    print_bk_stats(model, 'after init/pruning')
 
-    # 实测剪枝后 EBOPs，迭代修正到目标 ±3%
-    post_prune_ebops = compute_model_ebops(model, _sample_input)
-    print(f'  Post-prune EBOPs (measured): {post_prune_ebops:.1f}  target: {TARGET_EBOPS}')
+    if PRUNE_METHOD not in init_only_methods:
+        # 实测剪枝后 EBOPs，迭代修正到目标 ±3%
+        post_prune_ebops = compute_model_ebops(model, _sample_input)
+    print(f'  Post-stage EBOPs (measured): {post_prune_ebops:.1f}  target: {TARGET_EBOPS}')
     if snows_report is not None:
         print(
             f"  SNOWS repr-loss sum: "
@@ -506,11 +814,12 @@ if __name__ == '__main__':
             f"{snows_report['representation_loss_after_sum']:.6f}"
         )
     near_budget_preserve_case = (
-        PRUNE_METHOD == 'spectral_quant'
+        PRUNE_METHOD in {'spectral_quant', 'spectral_path'}
         and (not used_structured_low_budget)
         and actual_baseline_ebops <= float(TARGET_EBOPS) * 1.6
     )
-    if args.functional_calibrate:
+    ramanujan_mode = (PRUNE_METHOD == 'ramanujan_init')
+    if args.functional_calibrate and teacher_model is not None:
         post_func_ebops = teacher_guided_post_prune_calibration(
             student_model=model,
             teacher_model=teacher_model,
@@ -522,7 +831,9 @@ if __name__ == '__main__':
         )
         print(f'  Post-functional-calib EBOPs (measured): {post_func_ebops:.1f}')
 
-    if PRUNE_METHOD == 'spectral_quant':
+    if PRUNE_METHOD in {'random_init', 'ramanujan_init'}:
+        pass
+    elif PRUNE_METHOD in {'spectral_quant', 'spectral_path'}:
         post_prune_ebops = bisect_ebops_to_target(
             model,
             target_ebops=TARGET_EBOPS,
@@ -613,12 +924,34 @@ if __name__ == '__main__':
         phase2_lr_use = min(PHASE2_LR, 2e-4)
         print('\n  [Near-budget mode] use gentler LR to preserve pretrained accuracy.')
 
+    if use_const_projector:
+        phase1_beta_desc = 'fixed 0'
+    elif ramanujan_mode:
+        phase1_beta_desc = (f'auto [{RAM_P1_BETA_INIT:.1e}~{RAM_P1_BETA_MAX:.1e}] '
+                            f'warmup={RAM_P1_WARMUP}')
+    else:
+        phase1_beta_desc = f'auto [{PHASE1_BETA_INIT:.1e}~{PHASE1_BETA_MAX:.1e}]'
+
     print(f'\n[4/5] PHASE 1  Recovery  ({PHASE1_EPOCHS} epochs, '
-          f'lr={phase1_lr_use:.1e}, beta={"fixed 0" if use_const_projector else f"auto [{PHASE1_BETA_INIT:.1e}~{PHASE1_BETA_MAX:.1e}]"} )')
+          f'lr={phase1_lr_use:.1e}, beta={phase1_beta_desc} )')
 
     if use_const_projector:
         set_all_beta(model, 0.0)
         phase1_budget_ctrl = None
+    elif ramanujan_mode:
+        set_all_beta(model, RAM_P1_BETA_INIT)
+        phase1_budget_ctrl = BetaOnlyBudgetController(
+            target_ebops     = TARGET_EBOPS,
+            margin           = RAM_P1_MARGIN,
+            beta_init        = RAM_P1_BETA_INIT,
+            beta_min         = RAM_P1_BETA_MIN,
+            beta_max         = RAM_P1_BETA_MAX,
+            adjust_factor    = RAM_P1_ADJUST,
+            ema_alpha        = RAM_P1_EMA,
+            warmup_epochs    = RAM_P1_WARMUP,
+            max_change_ratio = RAM_P1_MAX_CHANGE,
+            init_ebops       = post_prune_ebops,
+        )
     else:
         set_all_beta(model, PHASE1_BETA_INIT)
         phase1_budget_ctrl = BetaOnlyBudgetController(
@@ -641,6 +974,13 @@ if __name__ == '__main__':
     if phase1_budget_ctrl is not None:
         # 双向 budget controller：EBOPs 过低时减 beta，过高时加 beta
         phase1_callbacks.insert(2, phase1_budget_ctrl)
+    if ramanujan_kqb_stabilizer is not None:
+        phase1_callbacks.insert(2 if phase1_budget_ctrl is None else 3, ramanujan_kqb_stabilizer)
+    if ramanujan_mask_enforcer is not None:
+        insert_idx = 2 if phase1_budget_ctrl is None else 3
+        if ramanujan_kqb_stabilizer is not None:
+            insert_idx += 1
+        phase1_callbacks.insert(insert_idx, ramanujan_mask_enforcer)
 
     model.fit(
         dataset_train,
@@ -669,8 +1009,15 @@ if __name__ == '__main__':
     #
     # initial_epoch=PHASE1_EPOCHS：epoch 计数连续，checkpoint 文件名不重置
     # ══════════════════════════════════════════════════════════════════════════
+    # 显式展示 Phase2 beta 配置，Ramanujan 分支沿用 v2 调参
+    if use_const_projector:
+        phase2_beta_desc = 'fixed 0'
+    elif ramanujan_mode:
+        phase2_beta_desc = f'auto (Ramanujan v2, margin=±{int(RAM_P2_MARGIN*100)}%)'
+    else:
+        phase2_beta_desc = 'auto'
     print(f'\n[5/5] PHASE 2  Accuracy Maximization  ({PHASE2_EPOCHS} epochs, '
-          f'lr={phase2_lr_use:.1e}, beta={"fixed 0" if use_const_projector else "auto"})')
+          f'lr={phase2_lr_use:.1e}, beta={phase2_beta_desc})')
 
     # 关键：继承 Phase 1 controller 找到的均衡 beta，而不是硬编码重置。
     # Phase 1 结束时 controller 已经找到维持 EBOPs≈target 的 beta 值，
@@ -682,25 +1029,45 @@ if __name__ == '__main__':
         print('  Inheriting Phase1 beta: 0.00e+00 (projector-only mode)')
     else:
         phase1_final_beta = phase1_budget_ctrl.beta_current
-        print(f'  Inheriting Phase1 equilibrium beta: {phase1_final_beta:.2e}')
         set_all_beta(model, phase1_final_beta)
-        phase2_margin = 0.05
-        phase2_adjust_factor = 1.15
-        phase2_ema = 0.15
-        phase2_beta_max_use = PHASE2_BETA_MAX
-        if near_budget_preserve_case:
-            phase2_margin = 0.08
-            phase2_adjust_factor = 1.08
-            phase2_ema = 0.20
-            phase2_beta_max_use = min(PHASE2_BETA_MAX, 2e-4)
+
+        if ramanujan_mode:
+            phase2_margin = RAM_P2_MARGIN
+            phase2_adjust_factor = RAM_P2_ADJUST
+            phase2_ema = RAM_P2_EMA
+            phase2_beta_max_use = RAM_P2_BETA_MAX
+            phase2_beta_min_use = RAM_P2_BETA_MIN
+            phase2_warmup = RAM_P2_WARMUP
+            phase2_max_change = RAM_P2_MAX_CHANGE
+            phase2_init_ebops = TARGET_EBOPS
+            print(f'  Inheriting Phase1 equilibrium beta: {phase1_final_beta:.2e} (Ramanujan v2 tuned)')
+        else:
+            phase2_margin = 0.05
+            phase2_adjust_factor = 1.15
+            phase2_ema = 0.15
+            phase2_beta_max_use = PHASE2_BETA_MAX
+            phase2_beta_min_use = PHASE2_BETA_MIN
+            phase2_warmup = 0
+            phase2_max_change = 0
+            phase2_init_ebops = None
+            if near_budget_preserve_case:
+                phase2_margin = 0.08
+                phase2_adjust_factor = 1.08
+                phase2_ema = 0.20
+                phase2_beta_max_use = min(PHASE2_BETA_MAX, 2e-4)
+            print(f'  Inheriting Phase1 equilibrium beta: {phase1_final_beta:.2e}')
+
         budget_ctrl = BetaOnlyBudgetController(
-            target_ebops  = TARGET_EBOPS,
-            margin        = phase2_margin,  # 紧容忍带（近预算时更平滑）
-            beta_init     = phase1_final_beta,  # 从 Phase 1 均衡点出发
-            beta_min      = PHASE2_BETA_MIN,
-            beta_max      = phase2_beta_max_use,
-            adjust_factor = phase2_adjust_factor,
-            ema_alpha     = phase2_ema,
+            target_ebops     = TARGET_EBOPS,
+            margin           = phase2_margin,
+            beta_init        = phase1_final_beta,
+            beta_min         = phase2_beta_min_use,
+            beta_max         = phase2_beta_max_use,
+            adjust_factor    = phase2_adjust_factor,
+            ema_alpha        = phase2_ema,
+            warmup_epochs    = phase2_warmup,
+            max_change_ratio = phase2_max_change,
+            init_ebops       = phase2_init_ebops,
         )
 
     early_stop_cb = BudgetAwareEarlyStopping(
@@ -723,6 +1090,8 @@ if __name__ == '__main__':
     if budget_ctrl is not None:
         # 核心：用自适应 beta 驱动 HGQ 自然维持 EBOPs，同时允许跨层重分配
         phase2_callbacks.insert(2, budget_ctrl)
+    if ramanujan_mask_enforcer is not None:
+        phase2_callbacks.insert(3 if budget_ctrl is not None else 2, ramanujan_mask_enforcer)
 
     # 重新编译（重置动量，避免 phase1 积累的动量干扰 phase2 精细收敛）
     model.compile(
