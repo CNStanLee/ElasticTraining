@@ -1019,10 +1019,10 @@ class SpectralGradientRevivalCallback(keras.callbacks.Callback):
     def __init__(
         self,
         target_ebops: float,
-        probe_x=None,                   # deprecated, kept for backward compat
-        probe_y=None,                   # deprecated, kept for backward compat
+        probe_x=None,                   # 梯度探针用的输入数据 (mini-batch)
+        probe_y=None,                   # 梯度探针用的标签
         min_degree: int = 2,
-        probe_val: float = 0.6,         # deprecated, kept for backward compat
+        probe_val: float = 0.6,         # 探针临时 kq.b 值（使 round_conv=1）
         revival_b_val: float = 1.0,     # 最终赋给复活连接的 _b 值（建议 >=1.0）
         max_revival_per_layer: int = 8, # 每层每次最多复活几个连接
         revival_interval: int = 200,    # 每隔多少 epoch 触发一次
@@ -1030,10 +1030,13 @@ class SpectralGradientRevivalCallback(keras.callbacks.Callback):
         dead_fraction_threshold: float = 0.90,  # 死连接比例 > thr 时也触发
         grad_min_threshold: float = 0.0,        # 复活所需最小 score；0=仅排序
         cool_down: int = 100,           # 上次复活后暂停 epoch 数
-        swap_kill: bool = True,         # 复活时同时淘汰等量弱连接，维持 eBOPs 预算
+        swap_kill: bool = False,        # 默认关闭：复活时不杀连接，eBOPs 变化由 BudgetController 控制
     ):
         super().__init__()
         self.target_ebops            = float(target_ebops)
+        self.probe_x                 = probe_x
+        self.probe_y                 = probe_y
+        self.probe_val               = float(probe_val)
         self.min_degree              = int(min_degree)
         self.revival_b_val           = float(revival_b_val)
         self.max_revival_per_layer   = int(max_revival_per_layer)
@@ -1105,38 +1108,122 @@ class SpectralGradientRevivalCallback(keras.callbacks.Callback):
         return list(candidates)
 
     def _batch_gradient_probe(self, layer_info: list) -> dict:
-        """A: 按候选连接的权重绝对值排序（代替 GradientTape，避免 Keras3 兼容问题）。
+        """A: 梯度探针排序 — 用 GradientTape 计算 |∂L/∂(kq.b)| 作为复活优先级。
 
-        对每层，访问 layer.kernel.numpy() 获取权重矩阵，按 |kernel[r,c]| 降序排列候选连接。
-        权重绝对值大的连接在激活后更可能对输出产生影响，因此作为复活优先级的代理。
-        若无法获取权重，则随机排序（保证有回退）。
+        流程:
+        1. 保存所有候选层的原始 kq.b 值
+        2. 将候选死连接的 kq.b 临时设为 probe_val（使 round_conv ≈ 1）
+        3. 用 probe_x/probe_y 做一次前向+反向，获取 ∂L/∂(kq.b)
+        4. 读取候选位置的 |grad|，恢复原始 kq.b
+        5. 按 |grad| 降序排列 → 梯度大的连接优先复活
+
+        若 probe_x/probe_y 未提供，退化为 |kernel| 排序作为回退。
 
         layer_info: list of (layer, b_var, b_arr_orig, candidates, orig_shape)
         Returns: dict { layer_idx: list of (score, r, c) } sorted desc
         """
+        import tensorflow as tf
+
+        # ── 检查是否有探针数据 ──
+        has_probe_data = (self.probe_x is not None and self.probe_y is not None)
+
+        if not has_probe_data:
+            # 回退：用 |kernel| 排序
+            return self._weight_magnitude_fallback(layer_info)
+
+        # ── 1. 保存原始 kq.b 并临时注入 probe_val ──
+        originals = {}  # {layer_idx: original_b_arr}
+        b_vars_watched = []  # 需要追踪梯度的变量
+        b_var_to_idx = {}    # {id(b_var): layer_idx}
+
+        for i, (layer, b_var, b_arr_orig, candidates, orig_shape) in enumerate(layer_info):
+            originals[i] = b_arr_orig.copy()
+            if not candidates:
+                continue
+            # 临时将候选死连接设为 probe_val
+            b_tmp = b_arr_orig.copy()
+            b_2d = b_tmp.reshape(b_arr_orig.shape[0], -1) if b_arr_orig.ndim > 2 else b_tmp
+            for (r, c) in candidates:
+                b_2d[r, c] = self.probe_val
+            if b_arr_orig.ndim > 2:
+                b_tmp = b_2d.reshape(orig_shape)
+            b_var.assign(b_tmp.astype(np.float32))
+            b_vars_watched.append(b_var)
+            b_var_to_idx[id(b_var)] = i
+
+        # ── 2. GradientTape 前向+反向 ──
+        # Keras 3 变量不支持 tape.watch()，但 trainable_variables 会被自动追踪
+        grad_map = {}  # {layer_idx: grad_arr}
+        try:
+            all_tv = self.model.trainable_variables
+            with tf.GradientTape() as tape:
+                y_pred = self.model(self.probe_x, training=True)
+                loss = tf.reduce_mean(
+                    keras.losses.sparse_categorical_crossentropy(
+                        self.probe_y, y_pred, from_logits=True
+                    )
+                )
+            grads = tape.gradient(loss, all_tv)
+            tv_to_grad = {id(v): g for v, g in zip(all_tv, grads) if g is not None}
+            for bv in b_vars_watched:
+                idx = b_var_to_idx[id(bv)]
+                g = tv_to_grad.get(id(bv))
+                if g is not None:
+                    grad_map[idx] = np.abs(g.numpy())
+                else:
+                    grad_map[idx] = None
+        except Exception as e:
+            print(f'  [Revival] GradientTape failed ({e}), falling back to |kernel|')
+            # 恢复原始 kq.b
+            for i, (layer, b_var, b_arr_orig, candidates, orig_shape) in enumerate(layer_info):
+                b_var.assign(originals[i].astype(np.float32))
+            return self._weight_magnitude_fallback(layer_info)
+
+        # ── 3. 恢复原始 kq.b ──
+        for i, (layer, b_var, b_arr_orig, candidates, orig_shape) in enumerate(layer_info):
+            b_var.assign(originals[i].astype(np.float32))
+
+        # ── 4. 按 |grad| 排序候选 ──
         results = {}
         for i, (layer, b_var, b_arr_orig, candidates, orig_shape) in enumerate(layer_info):
             if not candidates:
                 results[i] = []
                 continue
-            # 尝试获取权重矩阵
+            g_arr = grad_map.get(i)
+            scored = []
+            for (r, c) in candidates:
+                if g_arr is not None:
+                    g_2d = g_arr.reshape(g_arr.shape[0], -1) if g_arr.ndim > 2 else g_arr
+                    score = float(g_2d[r, c]) if r < g_2d.shape[0] and c < g_2d.shape[1] else 0.0
+                else:
+                    score = float(np.random.rand())
+                scored.append((score, r, c))
+            scored.sort(reverse=True)
+            results[i] = scored
+        return results
+
+    def _weight_magnitude_fallback(self, layer_info: list) -> dict:
+        """回退方案：当无探针数据时，按 |kernel| 排序。"""
+        results = {}
+        for i, (layer, b_var, b_arr_orig, candidates, orig_shape) in enumerate(layer_info):
+            if not candidates:
+                results[i] = []
+                continue
             w_mat = None
             kernel = getattr(layer, 'kernel', None)
             if kernel is not None:
                 try:
                     w = np.abs(np.array(kernel))
-                    # 展平到 2D: (n_in, n_out×...)
                     n_in = w.shape[0]
                     w_mat = w.reshape(n_in, -1)
                 except Exception:
                     w_mat = None
-
             scored = []
             for (r, c) in candidates:
                 if w_mat is not None and r < w_mat.shape[0] and c < w_mat.shape[1]:
                     score = float(w_mat[r, c])
                 else:
-                    score = float(np.random.rand())  # 无法获取权重时随机
+                    score = float(np.random.rand())
                 scored.append((score, r, c))
             scored.sort(reverse=True)
             results[i] = scored

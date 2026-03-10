@@ -1,36 +1,32 @@
 """
-Ramanujan 图初始化 v2 — 两阶段训练 + eBOPs 扫描
-================================================
-修复 v1 的训练策略问题，对齐 prune_finetune 的最优实践：
+Ramanujan 图初始化 v4 — 只 target 位宽 + 连接复活
+===================================================
+相比 v2 的简化与改进：
 
-v1 → v2 的改进
+v2 → v4 的改进
 --------------
-1. 两阶段训练（对齐 prune_finetune）：
-   - Phase 1 (恢复): 高 LR(2e-3), 宽 margin(±20%), mask 固定
-   - Phase 2 (精调): 低 LR(5e-4), 窄 margin(±5%), mask 释放, Adam 重置
-2. KQBStabilizer 稳定初期 kq.b，防止 eBOPs 漂移
-3. 校准到 1.00× 目标（不是 1.10×），让 budget controller 精确维持
-4. mask 保护只在 Phase 1，Phase 2 完全释放让 HGQ 自由优化拓扑
-5. 支持 --sweep 模式批量测试多个 eBOPs 目标，寻找 Pareto knee
+1. **只 target 位宽，不再校准 eBOPs**：
+   - 直接用 --init_bw (1/2/3) 初始化活跃连接的 kq.b
+   - 去掉 calibrate_kqb_to_target，eBOPs 完全由位宽自然决定
+   - 训练中用轻量 beta 控制让 HGQ 自由调节（不追求精确 eBOPs 目标）
+
+2. **连接复活 (SpectralGradientRevivalCallback)**：
+   - 每隔 revival_interval epoch，检查谱条件（度不足的节点）
+   - 按权重大小排序候选死连接，复活 top-k 并淘汰等量弱连接（swap-kill）
+   - 保持 eBOPs 预算不变的同时修复拓扑退化
+
+3. **Sweep over 1,2,3 bit**：
+   python train_run_ramanujan_init_v4.py --sweep_bw 1,2,3
 
 理论分析
 --------
 模型: input(16) → t1(64) → t2(64) → t3(32) → out(5)
 Ramanujan 谱条件 d-regular graph: λ₂ ≤ 2√(d-1)
 
-最小 Ramanujan 度（各层）:
-  t1:  d=6  (in=16, √16×1.5=6,  sparsity=62.5%)   384/1024 active
-  t2:  d=12 (in=64, √64×1.5=12, sparsity=81.2%)   768/4096 active
-  t3:  d=12 (in=64, √64×1.5=12, sparsity=81.2%)   384/2048 active
-  out: d=8  (in=32, √32×1.5=8,  sparsity=75.0%)    40/160 active
-
-最小谱条件度 (2√(N-1)+1):
-  t1:  d≥9   (in=16)  → mult=1.5 给 d=6 不满足严格谱条件
-  t2:  d≥17  (in=64)  → mult=1.5 给 d=12 不满足严格谱条件
-  → 说明 mult=1.5 是经验值，不是理论下限；对于小网络够用
-
-HGQ EBOPs 与 kq.b 的关系是非线性的（量化阶梯），
-实际可达的最小 eBOPs ≈ 660（所有活跃连接 b_k→0.5, 即 1-bit 量化）
+不同位宽下的初始 eBOPs 估算（活跃连接 × b_k × b_a≈3）:
+  1-bit:  eBOPs ≈  (384+768+384+40) × 1 × 3 =  4728
+  2-bit:  eBOPs ≈  (384+768+384+40) × 2 × 3 =  9456
+  3-bit:  eBOPs ≈  (384+768+384+40) × 3 × 3 = 14184
 """
 
 import os
@@ -56,8 +52,10 @@ from keras.callbacks import LearningRateScheduler
 from utils.train_utils import cosine_decay_restarts_schedule, TrainingTraceToH5, BudgetAwareEarlyStopping
 from utils.tf_device import get_tf_device
 from utils.ramanujan_budget_utils import (
+    ActivationBitsFixer,
     BetaOnlyBudgetController,
     KQBStabilizer,
+    SpectralGradientRevivalCallback,
     compute_bw_aware_degree,
     apply_ramanujan_bw_init,
     _flatten_layers,
@@ -72,67 +70,87 @@ from utils.topology_graph_plot_utils import TopologyGraphPlotter
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_CONFIG = dict(
-    target_ebops    = 2000, # 3162
-    init_bw_k       = 1,
+    init_bw         = 1,        # 活跃连接位宽 (1/2/3)
 
-    # Phase 1: 恢复 (对齐 prune_finetune)
+    # Phase 1: 恢复
     phase1_epochs   = 5000,
     phase1_lr       = 2e-3,
     phase1_lr_cycle = 2000,
     phase1_lr_mmul  = 0.9,
     phase1_beta_init = 5e-7,
     phase1_beta_min  = 1e-8,
-    phase1_beta_max  = 2e-4,
-    phase1_margin    = 0.20,
+    phase1_beta_max  = 5e-5,
+    phase1_margin    = 0.25,    # 宽 margin: 不死追 eBOPs，让 HGQ 自由学
 
-    # Phase 2: 精调 (对齐 prune_finetune)
+    # Phase 2: 精调
     phase2_epochs   = 10000,
     phase2_lr       = 5e-4,
     phase2_lr_cycle = 800,
     phase2_lr_mmul  = 0.95,
     phase2_beta_min  = 1e-7,
     phase2_beta_max  = 5e-4,
-    phase2_margin    = 0.05,
+    phase2_margin    = 0.10,
 
-    # Ramanujan
-    ram_multiplier  = 1.5,
-    ram_min_degree  = 4,
+    # Ramanujan 拓扑
+    ram_multiplier  = 0.75,
+    ram_min_degree  = 3,
     ram_budget_weight = 'capacity',
 
     # KQB Stabilizer
-    kqb_hold_epochs    = 50,
-    kqb_release_epochs = 200,
+    kqb_hold_epochs    = 500,
+    kqb_release_epochs = 1000,
     kqb_hold_strength  = 0.8,
+
+    # 连接复活
+    revival_enabled   = True,
+    revival_interval  = 200,
+    revival_max_per_layer = 8,
+    revival_b_val     = None,   # None = 和 init_bw 相同
+    revival_swap_kill  = False,
+    revival_min_degree = 2,
 
     # Early stopping
     earlystop_patience = 5000,
 )
 
 # ── 命令行参数 ────────────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description='Ramanujan-init v2: two-phase training with eBOPs sweep')
-parser.add_argument('--target_ebops',    type=float, default=DEFAULT_CONFIG['target_ebops'])
+parser = argparse.ArgumentParser(
+    description='Ramanujan-init v4: bitwidth-only targeting + connection revival')
+parser.add_argument('--init_bw',         type=int,   default=DEFAULT_CONFIG['init_bw'],
+                    help='Active connection kernel bitwidth: 1, 2, or 3 (default: 1)')
+parser.add_argument('--init_bw_a',       type=int,   default=None,
+                    help='Activation bitwidth (default: same as init_bw)')
 parser.add_argument('--phase1_epochs',   type=int,   default=DEFAULT_CONFIG['phase1_epochs'])
 parser.add_argument('--phase2_epochs',   type=int,   default=DEFAULT_CONFIG['phase2_epochs'])
 parser.add_argument('--phase1_lr',       type=float, default=DEFAULT_CONFIG['phase1_lr'])
 parser.add_argument('--phase2_lr',       type=float, default=DEFAULT_CONFIG['phase2_lr'])
-parser.add_argument('--init_bw_k',       type=int,   default=DEFAULT_CONFIG['init_bw_k'])
 parser.add_argument('--ram_multiplier',  type=float, default=DEFAULT_CONFIG['ram_multiplier'])
 parser.add_argument('--ram_min_degree',  type=int,   default=DEFAULT_CONFIG['ram_min_degree'])
 parser.add_argument('--mask_hold',       type=int,   default=None,
-                    help='Epochs to hold mask (default: phase1_epochs, i.e., entire Phase 1)')
+                    help='Epochs to hold mask (default: phase1_epochs)')
 parser.add_argument('--mask_fade',       type=int,   default=3000,
-                    help='Fade epochs for mask release (default: 3000, into Phase 2)')
-parser.add_argument('--sweep',           type=str,   default=None,
-                    help='Comma-separated eBOPs targets for sweep, e.g. "500,1000,1500,2000,3000"')
+                    help='Fade epochs for mask release (default: 3000)')
+parser.add_argument('--sweep_bw',        type=str,   default=None,
+                    help='Comma-separated bitwidths for sweep, e.g. "1,2,3"')
 parser.add_argument('--seed',            type=int,   default=42)
 parser.add_argument('--init_only',       action='store_true',
                     help='Only do Ramanujan init + save weights + plot graph, skip training')
-parser.add_argument('--skip_calib',      action='store_true',
-                    help='Skip calibration: start from high b_k and let budget controller compress')
-parser.add_argument('--calib_multiplier', type=float, default=1.0,
-                    help='Calibrate to target*multiplier eBOPs (e.g. 1.5 = calibrate 50%% above target)')
 parser.add_argument('--output_dir',      type=str, default='',
-                    help='Optional output directory for a single-target run')
+                    help='Optional output directory for a single run')
+# 连接复活参数
+parser.add_argument('--revival',         action=argparse.BooleanOptionalAction,
+                    default=DEFAULT_CONFIG['revival_enabled'],
+                    help='Enable/disable connection revival (default: enabled)')
+parser.add_argument('--revival_interval', type=int, default=DEFAULT_CONFIG['revival_interval'],
+                    help='Epochs between revival attempts (default: 200)')
+parser.add_argument('--revival_max_per_layer', type=int,
+                    default=DEFAULT_CONFIG['revival_max_per_layer'],
+                    help='Max connections revived per layer per attempt (default: 8)')
+parser.add_argument('--revival_b_val',   type=float, default=None,
+                    help='kq.b value for revived connections (default: same as init_bw)')
+parser.add_argument('--swap_kill',       action=argparse.BooleanOptionalAction,
+                    default=DEFAULT_CONFIG['revival_swap_kill'],
+                    help='Swap-kill: revive dead + kill weak to keep eBOPs stable (default: on)')
 args, _ = parser.parse_known_args()
 
 input_folder = 'data/dataset.h5'
@@ -205,69 +223,6 @@ def make_lr_scheduler(lr_init, cycle, mmul):
     return LearningRateScheduler(lambda epoch: fn(epoch))
 
 
-def calibrate_kqb_to_target(model, sample_input, target_ebops, snapshots=None):
-    """校准 kq.b 使实际 eBOPs ≈ target_ebops。返回 (actual_ebops, snapshots)。
-
-    策略：
-    1. 收集所有活跃 kq.b（>0.05）的快照
-    2. 加 ±20% 噪声打破量化对齐
-    3. 二分搜索全局缩放因子
-    """
-    if snapshots is None:
-        snapshots = []
-        for layer in _flatten_layers(model):
-            kq = getattr(layer, 'kq', None)
-            if kq is None:
-                continue
-            b_var = _get_kq_var(kq, 'b')
-            if b_var is None:
-                b_var = _get_kq_var(kq, 'f')
-            if b_var is not None:
-                snapshots.append((b_var, b_var.numpy().copy()))
-
-
-        # 加噪声打破量化阶梯对齐
-        rng = np.random.RandomState(42)
-        for b_var, b_snap in snapshots:
-            active = b_snap > 0.05
-            noise = rng.uniform(0.8, 1.2, size=b_snap.shape).astype(np.float32)
-            b_noisy = np.where(active, b_snap * noise, b_snap)
-            b_var.assign(b_noisy.astype(np.float32))
-        snapshots = [(bv, bv.numpy().copy()) for bv, _ in snapshots]
-
-    def _apply_scale(s):
-        for b_var, b_snap in snapshots:
-            active = b_snap > 0.05
-            b_new = np.where(active, (b_snap * s).clip(0.1, 8.0), b_snap)
-            b_var.assign(b_new.astype(np.float32))
-
-    def _measure(s):
-        _apply_scale(s)
-        return compute_model_ebops(model, sample_input)
-
-    lo, hi = 0.005, 5.0
-    noisy_ebops = _measure(1.0)
-    best_scale, best_ebops, best_err = 1.0, noisy_ebops, abs(noisy_ebops - target_ebops)
-
-    for i in range(50):
-        mid = (lo + hi) / 2.0
-        e = _measure(mid)
-        err = abs(e - target_ebops)
-        if err < best_err:
-            best_scale, best_ebops, best_err = mid, e, err
-        if err / max(target_ebops, 1) < 0.03:
-            best_scale, best_ebops = mid, e
-            break
-        if e > target_ebops:
-            hi = mid
-        else:
-            lo = mid
-
-    _apply_scale(best_scale)
-    actual = compute_model_ebops(model, sample_input)
-    return actual, snapshots
-
-
 def print_ramanujan_topology_stats(mdl):
     print('\n  ┌─ Ramanujan Topology ────────────────────────────────────────┐')
     for layer in _flatten_layers(mdl):
@@ -290,11 +245,17 @@ def print_ramanujan_topology_stats(mdl):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 单次训练
+# 单次训练（按位宽目标）
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_single_target(target_ebops: float, cfg: dict):
-    """对单个 eBOPs 目标执行完整的 Ramanujan 初始化 + 两阶段训练。"""
+def run_single_bw(init_bw: int, cfg: dict):
+    """对单个位宽目标执行完整的 Ramanujan 初始化 + 连接复活 + 两阶段训练。
+
+    与 v2 的核心区别：
+      - 不做 eBOPs 校准，活跃连接直接赋 kq.b = init_bw
+      - eBOPs 是位宽的自然结果，不是显式目标
+      - 训练中通过连接复活保持拓扑健康
+    """
 
     np.random.seed(cfg.get('seed', 42))
     random.seed(cfg.get('seed', 42))
@@ -303,25 +264,20 @@ def run_single_target(target_ebops: float, cfg: dict):
     phase2_epochs = cfg['phase2_epochs']
     total_epochs  = phase1_epochs + phase2_epochs
 
-    output_folder = cfg.get('output_dir', '') or f'results/ramanujan_v2_{int(target_ebops)}/'
-    if not cfg.get('output_dir', ''):
-        if cfg.get('skip_calib', False):
-            output_folder = f'results/ramanujan_v2_{int(target_ebops)}_skipcalib_v2/'
-        elif cfg.get('calib_multiplier', 1.0) > 1.01:
-            cm = cfg['calib_multiplier']
-            output_folder = f'results/ramanujan_v2_{int(target_ebops)}_cm{cm:.1f}/'
+    output_folder = cfg.get('output_dir', '') or f'results/ramanujan_v4_{init_bw}bit/'
     os.makedirs(output_folder, exist_ok=True)
     device = get_tf_device()
 
-    skip_calib = cfg.get('skip_calib', False)
+    revival_b_val = cfg.get('revival_b_val') or float(init_bw)
 
     print('=' * 72)
-    print(f'  Ramanujan-Init v2  |  target_ebops = {target_ebops:.0f}')
-    if skip_calib:
-        print(f'  Mode: SKIP CALIB — start high, compress to target')
+    print(f'  Ramanujan-Init v4  |  init_bw = {init_bw}-bit')
     print(f'  Phase 1: {phase1_epochs} epochs, lr={cfg["phase1_lr"]:.1e}, margin=±{cfg["phase1_margin"]*100:.0f}%')
     print(f'  Phase 2: {phase2_epochs} epochs, lr={cfg["phase2_lr"]:.1e}, margin=±{cfg["phase2_margin"]*100:.0f}%')
     print(f'  Ramanujan: mult={cfg["ram_multiplier"]}, min_degree={cfg["ram_min_degree"]}')
+    print(f'  Revival: enabled={cfg["revival_enabled"]}  interval={cfg["revival_interval"]}  '
+          f'max_per_layer={cfg["revival_max_per_layer"]}  swap_kill={cfg["revival_swap_kill"]}  '
+          f'b_val={revival_b_val}')
     print(f'  Output: {output_folder}')
     print('=' * 72)
 
@@ -333,21 +289,27 @@ def run_single_target(target_ebops: float, cfg: dict):
     dataset_train = Dataset(X_train, y_train, batch_size, device, shuffle=True)
     dataset_val   = Dataset(X_val,   y_val,   batch_size, device)
     _sample = tf.constant(X_train[:min(2048, len(X_train))], dtype=tf.float32)
+    _sample_y = tf.constant(y_train[:min(2048, len(y_train))], dtype=tf.int64)
 
     # ── 2. 构建模型 ──────────────────────────────────────────────────────────
-    print(f'\n[2/5] Building HGQ model (init_bw_k={cfg["init_bw_k"]})...')
-    model = get_model_hgq(init_bw_k=cfg['init_bw_k'], init_bw_a=3)
+    # 用 init_bw 作为模型构造时的初始位宽
+    init_bw_a = cfg.get('init_bw_a', None) or init_bw  # 默认与 kernel 位宽一致
+    print(f'\n[2/5] Building HGQ model (init_bw_k={init_bw}, init_bw_a={init_bw_a})...')
+    model = get_model_hgq(init_bw_k=init_bw, init_bw_a=init_bw_a)
 
     init_ebops = compute_model_ebops(model, _sample)
     print(f'  Random-init eBOPs: {init_ebops:.0f}')
 
-    # ── 3. Ramanujan 初始化 + 校准 ──────────────────────────────────────────
-    print(f'\n[3/5] Ramanujan BW-aware init → calibrate to {target_ebops:.0f} eBOPs...')
+    # ── 3. Ramanujan 初始化（只设位宽，不做 eBOPs 校准）─────────────────────
+    # 使用一个参考 target_ebops 来决定 Ramanujan 拓扑的度数，
+    # 但不再对 kq.b 做校准缩放
+    ref_target_ebops = init_ebops * 0.5  # 参考值，只影响拓扑度计算
+    print(f'\n[3/5] Ramanujan BW-aware init → {init_bw}-bit (no eBOPs calibration)...')
 
-    per_layer_degree, per_layer_bk = compute_bw_aware_degree(
+    per_layer_degree, _per_layer_bk = compute_bw_aware_degree(
         model,
-        target_ebops=target_ebops,
-        b_a_init=3.0,
+        target_ebops=ref_target_ebops,
+        b_a_init=float(init_bw_a),
         b_k_min=0.5,
         b_k_max=8.0,
         multiplier=cfg['ram_multiplier'],
@@ -356,8 +318,8 @@ def run_single_target(target_ebops: float, cfg: dict):
         verbose=True,
     )
 
-    # 4-bit 初始化（更高起点给网络更多学习容量，配合 floor 保护防止连接死亡）
-    INIT_BK = 4.0
+    # 直接用 init_bw 作为所有活跃连接的位宽 — 不校准
+    INIT_BK = float(init_bw)
     apply_ramanujan_bw_init(
         model,
         per_layer_degree=per_layer_degree,
@@ -371,110 +333,100 @@ def run_single_target(target_ebops: float, cfg: dict):
     )
 
     raw_ebops = compute_model_ebops(model, _sample)
-    print(f'  After topology (b_k={INIT_BK}): eBOPs = {raw_ebops:.0f}')
+    print(f'  After Ramanujan init (b_k={init_bw}): eBOPs = {raw_ebops:.0f}')
+    print(f'  (eBOPs is a natural consequence of {init_bw}-bit, not a target)')
     print_ramanujan_topology_stats(model)
+    print_bk_stats(model, f'{init_bw}-bit init')
 
-    # ── 3.5 保存校准前权重 + 绘制纯拓扑图（b_k=4.0，所有连接清晰可见）────
-    pre_calib_path = os.path.join(output_folder, 'ramanujan_init_pre_calib.keras')
-    model.save(pre_calib_path)
-    print(f'  Pre-calibration weights saved: {pre_calib_path}')
+    # ── 3.5 保存初始化权重 + 绘制拓扑图 ──────────────────────────────────────
+    init_model_path = os.path.join(output_folder, f'ramanujan_init_{init_bw}bit.keras')
+    model.save(init_model_path)
+    print(f'  Init weights saved: {init_model_path}')
 
     topo_plot_dir = os.path.join(output_folder, 'init_graph')
     plotter = TopologyGraphPlotter(symmetric_topology_plot=False, mirror_edges=False)
     topo_outputs = plotter.plot_from_keras(
-        keras_path=pre_calib_path,
+        keras_path=init_model_path,
         output_dir=topo_plot_dir,
     )
     print(f'  Ramanujan topology matrix: {topo_outputs["matrix_path"]}')
     print(f'  Ramanujan topology circle: {topo_outputs["circle_path"]}')
 
-    # 决定是否校准：skip_calib 模式从高位宽开始，让 budget controller 逐步压缩
-    skip_calib = cfg.get('skip_calib', False)
-    if skip_calib:
-        print(f'  [skip_calib] Starting from b_k={INIT_BK}, eBOPs={raw_ebops:.0f}.')
-        print(f'  Budget controller will compress {raw_ebops:.0f} → {target_ebops:.0f} during Phase 1.')
-        start_ebops = raw_ebops
-    else:
-        # 校准到 calib_multiplier × 目标
-        calib_mult = cfg.get('calib_multiplier', 1.0)
-        calib_target = target_ebops * calib_mult
-        calib_ebops, _ = calibrate_kqb_to_target(model, _sample, calib_target)
-        print(f'  After calibration: eBOPs = {calib_ebops:.0f}  (calib_target = {calib_target:.0f}, final_target = {target_ebops:.0f})')
-        print_bk_stats(model, 'calibrated')
-        start_ebops = calib_ebops
-
-    # ── 3.6 保存初始化权重 ──────────────────────────────────────────────────
-    init_model_path = os.path.join(output_folder, 'ramanujan_init.keras')
-    model.save(init_model_path)
-    print(f'  Init weights saved: {init_model_path}')
-
     if cfg.get('init_only', False):
         print(f'\n  [init_only] Done. Skipping training.')
         return {
-            'target_ebops':  target_ebops,
-            'start_ebops':   start_ebops,
+            'init_bw':       init_bw,
+            'init_ebops':    raw_ebops,
             'init_model':    init_model_path,
-            'pre_calib_model': pre_calib_path,
             'matrix_plot':   str(topo_outputs['matrix_path']),
             'circle_plot':   str(topo_outputs['circle_path']),
         }
 
-    # ── 4. Phase 1: 恢复训练 ─────────────────────────────────────────────────
-    print(f'\n[4/5] Phase 1: Recovery  ({phase1_epochs} epochs)')
+    # ── 4. Phase 1: 恢复训练 + 连接复活 ──────────────────────────────────────
+    print(f'\n[4/5] Phase 1: Recovery + Revival  ({phase1_epochs} epochs)')
 
     set_all_beta(model, cfg['phase1_beta_init'])
 
     # KQB Stabilizer: 锚定 kq.b 防止初期漂移
-    # skip_calib 模式不需要 stabilizer（b_k 很高，不怕漂移）
-    if skip_calib:
-        kqb_stab = None
-    else:
-        kqb_stab = KQBStabilizer(
-            hold_epochs=cfg['kqb_hold_epochs'],
-            release_epochs=cfg['kqb_release_epochs'],
-            hold_strength=cfg['kqb_hold_strength'],
-        )
-        kqb_stab.capture_snapshot(model)
+    kqb_stab = KQBStabilizer(
+        hold_epochs=cfg['kqb_hold_epochs'],
+        release_epochs=cfg['kqb_release_epochs'],
+        hold_strength=cfg['kqb_hold_strength'],
+    )
+    kqb_stab.capture_snapshot(model)
 
-    # skip_calib 模式：从 4× 目标压缩，需要较强 beta 但配合 floor 保护
-    if skip_calib:
-        p1_beta_init = cfg.get('phase1_beta_init_skip', 1e-4)
-        p1_beta_max  = cfg.get('phase1_beta_max_skip', 2e-3)
-        p1_warmup    = 50
-    else:
-        p1_beta_init = cfg['phase1_beta_init']
-        p1_beta_max  = cfg['phase1_beta_max']
-        p1_warmup    = 100
-
+    # Budget controller: 轻量控制，用较宽 margin
+    # 以初始 eBOPs 为参考目标（不强制压缩/扩张，只防止极端漂移）
     phase1_budget_ctrl = BetaOnlyBudgetController(
-        target_ebops    = target_ebops,
+        target_ebops    = raw_ebops,  # 以初始化后的自然 eBOPs 为目标
         margin          = cfg['phase1_margin'],
-        beta_init       = p1_beta_init,
+        beta_init       = cfg['phase1_beta_init'],
         beta_min        = cfg['phase1_beta_min'],
-        beta_max        = p1_beta_max,
+        beta_max        = cfg['phase1_beta_max'],
         adjust_factor   = 1.15,
         ema_alpha       = 0.25,
-        warmup_epochs   = p1_warmup,
+        warmup_epochs   = 100,
         max_change_ratio = 1.5,
-        init_ebops      = start_ebops,
+        init_ebops      = raw_ebops,
     )
 
-    # Mask enforcer: 起点高于目标时保护拓扑，逐步释放
-    use_floor = skip_calib or cfg.get('calib_multiplier', 1.0) > 1.01
-    if skip_calib:
-        mask_hold = cfg.get('mask_hold_skip', 2000)
-        mask_fade = cfg.get('mask_fade_skip', 3000)
-    elif use_floor:
-        # calib_multiplier > 1: 校准略高于目标，温和保护
-        mask_hold = cfg.get('mask_hold', min(2000, phase1_epochs))
-        mask_fade = cfg.get('mask_fade', 3000)
-    else:
-        mask_hold = cfg.get('mask_hold', phase1_epochs)
-        mask_fade = cfg.get('mask_fade', 3000)
+    # 连接复活回调
+    # 用小批量训练数据做梯度探针，决定复活优先级
+    _revival_probe_n = min(512, len(X_train))
+    _revival_probe_x = tf.constant(X_train[:_revival_probe_n], dtype=tf.float32)
+    _revival_probe_y = tf.constant(y_train[:_revival_probe_n], dtype=tf.int64)
+
+    revival_cb = None
+    if cfg['revival_enabled']:
+        revival_cb = SpectralGradientRevivalCallback(
+            target_ebops=raw_ebops,
+            probe_x=_revival_probe_x,
+            probe_y=_revival_probe_y,
+            min_degree=cfg['revival_min_degree'],
+            revival_b_val=revival_b_val,
+            max_revival_per_layer=cfg['revival_max_per_layer'],
+            revival_interval=cfg['revival_interval'],
+            ebops_deficit_threshold=0.20,
+            dead_fraction_threshold=0.85,
+            grad_min_threshold=0.0,
+            cool_down=cfg['revival_interval'] // 2,
+            swap_kill=cfg['revival_swap_kill'],
+        )
+        print(f'  [Revival] enabled: interval={cfg["revival_interval"]}  '
+              f'max_per_layer={cfg["revival_max_per_layer"]}  '
+              f'swap_kill={cfg["revival_swap_kill"]}  '
+              f'b_val={revival_b_val}')
+
+    # Mask enforcer: 保护 Ramanujan 拓扑
+    # min_active_frac_bits 防止活跃连接被 beta 正则化压死
+    # 对 1-bit init，floor=0.5 确保 round(kq.b) >= 1
+    min_active_floor = max(0.5, float(init_bw) * 0.5)
+    mask_hold = cfg.get('mask_hold', phase1_epochs)
+    mask_fade = cfg.get('mask_fade', 3000)
     mask_enforcer = RamanujanMaskEnforcer(
         release_epoch=mask_hold,
         fade_epochs=mask_fade,
-        min_active_frac_bits=1.0 if use_floor else None,
+        min_active_frac_bits=min_active_floor,
     )
 
     ebops_cb  = FreeEBOPs()
@@ -498,16 +450,22 @@ def run_single_target(target_ebops: float, cfg: dict):
         steps_per_execution=32,
     )
 
+    # Activation bits fixer: 固定激活位宽，防止训练中漂移
+    act_bits_fixer = ActivationBitsFixer(b_a_fixed=float(init_bw_a), start_epoch=0)
+
     phase1_callbacks = [
         ebops_cb,
         phase1_budget_ctrl,
-        mask_enforcer,        # 保护 Ramanujan 拓扑
+        kqb_stab,
+        mask_enforcer,
+        act_bits_fixer,
         pareto_cb,
         make_lr_scheduler(cfg['phase1_lr'], cfg['phase1_lr_cycle'], cfg['phase1_lr_mmul']),
         trace_cb,
     ]
-    if kqb_stab is not None:
-        phase1_callbacks.insert(2, kqb_stab)  # 稳定 kq.b
+    if revival_cb is not None:
+        # 复活回调放 mask_enforcer 之后，让复活的连接立刻受 mask 保护
+        phase1_callbacks.insert(4, revival_cb)
 
     print(f'  Starting Phase 1...')
     model.fit(
@@ -525,24 +483,41 @@ def run_single_target(target_ebops: float, cfg: dict):
           f'beta={phase1_beta:.2e}')
     print_bk_stats(model, 'end of Phase 1')
 
-    # ── 5. Phase 2: 精调 ─────────────────────────────────────────────────────
-    print(f'\n[5/5] Phase 2: Accuracy maximization  ({phase2_epochs} epochs)')
+    # ── 5. Phase 2: 精调 + 连接复活继续 ──────────────────────────────────────
+    print(f'\n[5/5] Phase 2: Accuracy maximization + Revival  ({phase2_epochs} epochs)')
     print(f'  Recompiling with fresh Adam optimizer...')
 
     phase2_budget_ctrl = BetaOnlyBudgetController(
-        target_ebops    = target_ebops,
-        margin          = cfg['phase2_margin'],    # 窄 margin
-        beta_init       = phase1_beta,             # 继承 Phase 1 的均衡 beta
+        target_ebops    = phase1_ebops,  # 以 Phase 1 结束时的 eBOPs 为目标
+        margin          = cfg['phase2_margin'],
+        beta_init       = phase1_beta,
         beta_min        = cfg['phase2_beta_min'],
         beta_max        = cfg['phase2_beta_max'],
         adjust_factor   = 1.15,
-        ema_alpha       = 0.15,                    # 更平滑
-        warmup_epochs   = 0,                       # 不需要 warmup
+        ema_alpha       = 0.15,
+        warmup_epochs   = 0,
         max_change_ratio = 1.5,
-        init_ebops      = target_ebops,
+        init_ebops      = phase1_ebops,
     )
 
-    # 重新编译（重置 Adam momentum，避免 Phase 1 的惯性干扰 Phase 2 精调）
+    # Phase 2 也可以继续复活
+    revival_cb_p2 = None
+    if cfg['revival_enabled']:
+        revival_cb_p2 = SpectralGradientRevivalCallback(
+            target_ebops=phase1_ebops,
+            probe_x=_revival_probe_x,
+            probe_y=_revival_probe_y,
+            min_degree=cfg['revival_min_degree'],
+            revival_b_val=revival_b_val,
+            max_revival_per_layer=cfg['revival_max_per_layer'],
+            revival_interval=cfg['revival_interval'] * 2,  # Phase 2 间隔更大
+            ebops_deficit_threshold=0.15,                   # Phase 2 触发更保守
+            dead_fraction_threshold=0.90,
+            grad_min_threshold=0.0,
+            cool_down=cfg['revival_interval'],
+            swap_kill=cfg['revival_swap_kill'],
+        )
+
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=cfg['phase2_lr']),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
@@ -550,7 +525,7 @@ def run_single_target(target_ebops: float, cfg: dict):
         steps_per_execution=32,
     )
 
-    earlystop_budget = target_ebops * 1.5
+    earlystop_budget = phase1_ebops * 2.0  # 宽松: 不以 eBOPs 为硬约束
     early_stop_cb = BudgetAwareEarlyStopping(
         ebops_budget         = earlystop_budget,
         patience             = cfg['earlystop_patience'],
@@ -559,16 +534,18 @@ def run_single_target(target_ebops: float, cfg: dict):
         restore_best_weights = True,
     )
 
-    # Phase 2: mask enforcer 继续（fade 会在 Phase 2 逐渐放开或已经完全放开）
     phase2_callbacks = [
         ebops_cb,
         phase2_budget_ctrl,
-        mask_enforcer,        # fade 继续，直到完全放开
+        mask_enforcer,
+        act_bits_fixer,
         pareto_cb,
         make_lr_scheduler(cfg['phase2_lr'], cfg['phase2_lr_cycle'], cfg['phase2_lr_mmul']),
         trace_cb,
         early_stop_cb,
     ]
+    if revival_cb_p2 is not None:
+        phase2_callbacks.insert(3, revival_cb_p2)
 
     model.fit(
         dataset_train,
@@ -587,13 +564,15 @@ def run_single_target(target_ebops: float, cfg: dict):
     print_ramanujan_topology_stats(model)
 
     result = {
-        'target_ebops':   target_ebops,
+        'init_bw':        init_bw,
+        'init_ebops':     raw_ebops,
         'final_ebops':    final_ebops,
         'final_val_acc':  float(final_res[1]),
         'final_val_loss': float(final_res[0]),
         'phase1_val_acc': float(phase1_res[1]),
         'phase1_ebops':   phase1_ebops,
         'elapsed_sec':    elapsed,
+        'revival_enabled': cfg['revival_enabled'],
         'config':         {k: v for k, v in cfg.items()},
     }
 
@@ -607,16 +586,9 @@ def run_single_target(target_ebops: float, cfg: dict):
             result['best_val_acc'] = float(va.max())
             result['best_epoch']   = int(va.argmax())
             result['best_ebops']   = float(eb[va.argmax()])
-            # 条件筛选：eBOPs ≤ 1.1× target 时的最佳
-            mask = eb <= target_ebops * 1.1
-            if mask.any():
-                filtered = np.where(mask, va, 0)
-                best_filtered = filtered.argmax()
-                result['best_acc_in_budget'] = float(va[best_filtered])
-                result['best_epoch_in_budget'] = int(best_filtered)
 
     print(f'\n  {"=" * 60}')
-    print(f'  target={target_ebops:.0f}  final_ebops={final_ebops:.0f}  '
+    print(f'  init_bw={init_bw}  init_ebops={raw_ebops:.0f}  final_ebops={final_ebops:.0f}  '
           f'val_acc={final_res[1]:.4f}  best_acc={result.get("best_val_acc", 0):.4f}  '
           f'time={elapsed:.0f}s')
     print(f'  {"=" * 60}')
@@ -639,62 +611,67 @@ if __name__ == '__main__':
     # 构建配置 dict
     cfg = dict(DEFAULT_CONFIG)
     cfg['seed'] = args.seed
-    cfg['target_ebops']   = args.target_ebops
+    cfg['init_bw']        = args.init_bw
+    cfg['init_bw_a']      = args.init_bw_a  # None = same as init_bw
     cfg['phase1_epochs']  = args.phase1_epochs
     cfg['phase2_epochs']  = args.phase2_epochs
     cfg['phase1_lr']      = args.phase1_lr
     cfg['phase2_lr']      = args.phase2_lr
-    cfg['init_bw_k']      = args.init_bw_k
     cfg['ram_multiplier'] = args.ram_multiplier
     cfg['ram_min_degree'] = args.ram_min_degree
     cfg['mask_hold']      = args.mask_hold if args.mask_hold is not None else args.phase1_epochs
     cfg['mask_fade']      = args.mask_fade
     cfg['init_only']      = args.init_only
-    cfg['skip_calib']     = args.skip_calib
-    cfg['calib_multiplier'] = args.calib_multiplier
     cfg['output_dir']     = args.output_dir
+    cfg['revival_enabled']       = args.revival
+    cfg['revival_interval']      = args.revival_interval
+    cfg['revival_max_per_layer'] = args.revival_max_per_layer
+    cfg['revival_b_val']         = args.revival_b_val
+    cfg['revival_swap_kill']     = args.swap_kill
 
-    if args.sweep:
-        # ── Sweep 模式 ───────────────────────────────────────────────────────
-        targets = [float(x.strip()) for x in args.sweep.split(',')]
+    if args.sweep_bw:
+        # ── Sweep 模式：批量测试不同位宽 ─────────────────────────────────────
+        bws = [int(x.strip()) for x in args.sweep_bw.split(',')]
         print(f'\n{"#" * 72}')
-        print(f'  Ramanujan v2 — eBOPs SWEEP:  {targets}')
+        print(f'  Ramanujan v4 — Bitwidth SWEEP:  {bws}')
+        print(f'  Revival: enabled={cfg["revival_enabled"]}  swap_kill={cfg["revival_swap_kill"]}')
         print(f'{"#" * 72}\n')
 
         all_results = []
-        for t in targets:
+        for bw in bws:
             cfg_copy = dict(cfg)
-            result = run_single_target(t, cfg_copy)
+            cfg_copy['output_dir'] = ''  # 让每次运行自动命名
+            result = run_single_bw(bw, cfg_copy)
             all_results.append(result)
 
-            # 打印累积 Pareto
-            print(f'\n  ── Sweep progress (Pareto so far) ──')
-            for r in sorted(all_results, key=lambda x: x['target_ebops']):
-                print(f'    target={r["target_ebops"]:6.0f}  '
-                      f'best_acc={r.get("best_val_acc", 0):.4f}  '
-                      f'best_in_budget={r.get("best_acc_in_budget", 0):.4f}  '
-                      f'final_ebops={r["final_ebops"]:.0f}')
+            # 打印累积进度
+            print(f'\n  ── Sweep progress ──')
+            for r in sorted(all_results, key=lambda x: x['init_bw']):
+                print(f'    {r["init_bw"]}-bit:  init_ebops={r["init_ebops"]:.0f}  '
+                      f'final_ebops={r.get("final_ebops", 0):.0f}  '
+                      f'best_acc={r.get("best_val_acc", 0):.4f}')
             print()
 
         # 保存 sweep 汇总
-        sweep_summary_path = 'results/ramanujan_v2_sweep_summary.json'
+        sweep_summary_path = 'results/ramanujan_v4_bw_sweep_summary.json'
+        os.makedirs('results', exist_ok=True)
         with open(sweep_summary_path, 'w') as f:
             json.dump(all_results, f, indent=2)
         print(f'\nSweep summary saved: {sweep_summary_path}')
 
-        # 最终 Pareto 表
+        # 最终表格
         print(f'\n{"=" * 72}')
-        print(f'  Ramanujan v2 Sweep — Final Pareto')
-        print(f'  {"target":>8s}  {"best_acc":>8s}  {"in_budget":>9s}  {"final_eb":>8s}  {"time":>6s}')
-        print(f'  {"-" * 50}')
-        for r in sorted(all_results, key=lambda x: x['target_ebops']):
-            print(f'  {r["target_ebops"]:8.0f}  '
+        print(f'  Ramanujan v4 Bitwidth Sweep — Final Results')
+        print(f'  {"bw":>4s}  {"init_eb":>8s}  {"final_eb":>8s}  {"best_acc":>8s}  {"time":>6s}')
+        print(f'  {"-" * 44}')
+        for r in sorted(all_results, key=lambda x: x['init_bw']):
+            print(f'  {r["init_bw"]:4d}  '
+                  f'{r["init_ebops"]:8.0f}  '
+                  f'{r.get("final_ebops", 0):8.0f}  '
                   f'{r.get("best_val_acc", 0):8.4f}  '
-                  f'{r.get("best_acc_in_budget", 0):9.4f}  '
-                  f'{r["final_ebops"]:8.0f}  '
-                  f'{r["elapsed_sec"]:5.0f}s')
+                  f'{r.get("elapsed_sec", 0):5.0f}s')
         print(f'{"=" * 72}')
 
     else:
         # ── 单次运行 ─────────────────────────────────────────────────────────
-        run_single_target(cfg['target_ebops'], cfg)
+        run_single_bw(cfg['init_bw'], cfg)
