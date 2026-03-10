@@ -77,9 +77,12 @@ from .pruning import (
     apply_ramanujan_bw_init,
     RamanujanMaskEnforcer,
     spectral_quant_prune_to_ebops,
+    SensitivityAwarePruner,
     bisect_ebops_to_target,
     snap_active_bk,
     compute_model_ebops,
+    random_prune_to_ebops,
+    magnitude_prune_to_ebops,
 )
 from .budget import (
     BetaOnlyBudgetController,
@@ -89,6 +92,7 @@ from .budget import (
     ProgressiveBudgetController,
     BetaCurriculumController,
     AdaptiveLRBiwidthScaler,
+    EBOPsConstantProjector,
     _set_all_beta,
     _get_active_bk_mean,
 )

@@ -1180,3 +1180,92 @@ def snap_active_bk(
             n_killed += layer_killed
 
     return n_snapped, n_killed
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Ablation 剪枝方法: random / magnitude (用于对比实验)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def random_prune_to_ebops(model, target_ebops: float, sample_input, b_floor=0.35,
+                          b_ceiling=6.0, seed=42, verbose=True):
+    """随机剪枝到目标 eBOPs (无谱约束, 无连通保证)。
+
+    对每层随机选择保留的连接 (同等稀疏率), 不考虑拓扑连通性。
+    用于 ablation 对比, 展示谱约束的必要性。
+    """
+    rng = np.random.RandomState(seed)
+    current_ebops = compute_model_ebops(model, sample_input)
+    if current_ebops <= 0:
+        return
+    keep_ratio = min(1.0, float(target_ebops) / float(current_ebops))
+
+    for layer in _flatten_layers(model):
+        kq = getattr(layer, 'kq', None)
+        if kq is None or not hasattr(layer, 'kernel'):
+            continue
+        b_var = _get_kq_var(kq, 'b')
+        if b_var is None:
+            b_var = _get_kq_var(kq, 'f')
+        if b_var is None:
+            continue
+        shape = layer.kernel.shape
+        mask = (rng.rand(*shape) < keep_ratio).astype(np.float32)
+        _apply_mask_and_quant(layer, mask, b_floor=b_floor, b_ceiling=b_ceiling)
+        if verbose:
+            print(f'  [RandomPrune] {layer.name:20s}  '
+                  f'keep={int(mask.sum())}/{int(np.prod(shape))}  '
+                  f'sparsity={1 - mask.mean():.3f}')
+
+    measured = compute_model_ebops(model, sample_input)
+    if verbose:
+        print(f'[RandomPrune] target={target_ebops:.0f}  measured={measured:.0f}')
+    return measured
+
+
+def magnitude_prune_to_ebops(model, target_ebops: float, sample_input, b_floor=0.35,
+                             b_ceiling=6.0, verbose=True):
+    """权重幅值剪枝到目标 eBOPs (全局 top-k, 无谱约束)。
+
+    全局收集所有权重绝对值, 找到阈值使保留连接的 eBOPs ≈ target。
+    用于 ablation 对比, 展示谱约束对极低预算的优势。
+    """
+    current_ebops = compute_model_ebops(model, sample_input)
+    if current_ebops <= 0:
+        return
+    keep_ratio = min(1.0, float(target_ebops) / float(current_ebops))
+
+    # 收集所有权重绝对值
+    all_abs = []
+    for layer in _flatten_layers(model):
+        kq = getattr(layer, 'kq', None)
+        if kq is None or not hasattr(layer, 'kernel'):
+            continue
+        all_abs.extend(np.abs(layer.kernel.numpy()).ravel().tolist())
+
+    if not all_abs:
+        return
+    all_abs = np.array(all_abs)
+    n_keep = max(1, int(len(all_abs) * keep_ratio))
+    threshold = float(np.sort(all_abs)[-n_keep]) if n_keep < len(all_abs) else 0.0
+
+    for layer in _flatten_layers(model):
+        kq = getattr(layer, 'kq', None)
+        if kq is None or not hasattr(layer, 'kernel'):
+            continue
+        b_var = _get_kq_var(kq, 'b')
+        if b_var is None:
+            b_var = _get_kq_var(kq, 'f')
+        if b_var is None:
+            continue
+        w = np.abs(layer.kernel.numpy())
+        mask = (w >= threshold).astype(np.float32)
+        _apply_mask_and_quant(layer, mask, b_floor=b_floor, b_ceiling=b_ceiling)
+        if verbose:
+            print(f'  [MagnitudePrune] {layer.name:20s}  '
+                  f'keep={int(mask.sum())}/{int(np.prod(w.shape))}  '
+                  f'sparsity={1 - mask.mean():.3f}')
+
+    measured = compute_model_ebops(model, sample_input)
+    if verbose:
+        print(f'[MagnitudePrune] threshold={threshold:.6f}  '
+              f'target={target_ebops:.0f}  measured={measured:.0f}')
+    return measured

@@ -621,3 +621,122 @@ class AdaptiveLRBiwidthScaler(keras.callbacks.Callback):
         if self.log:
             print(f'  [AdaptiveLR] epoch={epoch}  '
                   f'mean_bk={mean_bk:.3f}  factor={factor:.2f}  lr={new_lr:.2e}')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EBOPsConstantProjector — 直接投影维持 eBOPs (极低预算必备)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class EBOPsConstantProjector(keras.callbacks.Callback):
+    """每 epoch 结束后将全部活跃 kq.b 等比缩放，使总 eBOPs 维持在 target。
+
+    设计用于极低预算场景 (ebops ≤ 500)，替代 beta 调控:
+      - beta 在 1-bit 下完全失效 (STE 梯度噪声 >> 任务梯度)
+      - 直接投影无需 beta，避免连接被压死
+
+    振荡抑制:
+      1. 幂次阻尼: α = (target/current)^gamma, gamma<1 做部分修正
+      2. alpha 限幅: clip(α, alpha_min, alpha_max)
+      3. EMA 平滑: 减少噪声驱动的过调
+
+    Parameters
+    ----------
+    target_ebops : float
+        目标 eBOPs
+    b_k_min : float
+        kq.b 下限 (默认 0.5，保证至少 1-bit)
+    b_k_max : float
+        kq.b 上限
+    pruned_threshold : float
+        kq.b ≤ 该阈值视为剪掉，不参与缩放
+    alpha_gamma : float
+        幂次阻尼指数，越小越保守 (默认 0.5)
+    alpha_min, alpha_max : float
+        alpha 限幅
+    ema_alpha : float
+        eBOPs EMA 平滑系数
+    """
+
+    def __init__(
+        self,
+        target_ebops: float,
+        b_k_min: float = 0.5,
+        b_k_max: float = 8.0,
+        pruned_threshold: float = 0.1,
+        start_epoch: int = 0,
+        alpha_gamma: float = 0.5,
+        alpha_min: float = 0.80,
+        alpha_max: float = 1.25,
+        ema_alpha: float = 0.3,
+        project_activation: bool = False,
+        log_scale: bool = False,
+    ):
+        super().__init__()
+        self.target_ebops = float(target_ebops)
+        self.b_k_min = b_k_min
+        self.b_k_max = b_k_max
+        self.pruned_threshold = pruned_threshold
+        self.start_epoch = start_epoch
+        self.alpha_gamma = alpha_gamma
+        self.alpha_min = alpha_min
+        self.alpha_max = alpha_max
+        self.ema_alpha = ema_alpha
+        self.project_activation = project_activation
+        self.log_scale = log_scale
+        self._ebops_ema = None
+
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch < self.start_epoch:
+            return
+
+        logs = logs or {}
+        raw_ebops = float(logs.get('ebops', float('nan')))
+        if not math.isfinite(raw_ebops) or raw_ebops <= 0:
+            return
+
+        if self._ebops_ema is None:
+            self._ebops_ema = raw_ebops
+        else:
+            self._ebops_ema = (self.ema_alpha * raw_ebops
+                               + (1.0 - self.ema_alpha) * self._ebops_ema)
+        current_ebops = self._ebops_ema
+
+        raw_alpha = self.target_ebops / current_ebops
+        alpha = raw_alpha ** self.alpha_gamma
+        alpha = float(np.clip(alpha, self.alpha_min, self.alpha_max))
+
+        for layer in _flatten_layers(self.model):
+            kq = getattr(layer, 'kq', None)
+            if kq is None:
+                continue
+
+            b_var = _get_kq_var(kq, 'b')
+            if b_var is None:
+                b_var = _get_kq_var(kq, 'f')
+            if b_var is None:
+                continue
+
+            b_arr = b_var.numpy()
+            active_mask = (b_arr > self.pruned_threshold).astype(np.float32)
+            b_new = np.where(
+                active_mask > 0,
+                np.clip(b_arr * alpha, self.b_k_min, self.b_k_max),
+                b_arr,
+            )
+            b_var.assign(b_new.astype(np.float32))
+
+            if self.project_activation:
+                aq = getattr(layer, 'aq', None)
+                if aq is not None:
+                    ab_var = _get_kq_var(aq, 'b')
+                    if ab_var is None:
+                        ab_var = _get_kq_var(aq, 'f')
+                    if ab_var is not None:
+                        a_arr = ab_var.numpy()
+                        a_new = np.clip(a_arr * alpha, self.b_k_min, self.b_k_max)
+                        ab_var.assign(a_new.astype(np.float32))
+
+        if self.log_scale:
+            print(f'  [Projector] ep={epoch}  raw={raw_ebops:.0f}  '
+                  f'ema={current_ebops:.0f}  target={self.target_ebops:.0f}  '
+                  f'α={alpha:.4f}')

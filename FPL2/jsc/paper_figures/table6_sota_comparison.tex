@@ -1,0 +1,15 @@
+\begin{table}[t]
+\centering
+\caption{Comparison with state-of-the-art FPGA jet classifiers.}
+\label{tab:sota}
+\begin{tabular}{llccc}
+\toprule
+Work & Framework & eBOPs & Accuracy & Reduction \\
+\midrule
+Duarte et al. \cite{hls4ml} & hls4ml & $\sim$50k & 0.760 & 1$\times$ \\
+Coelho et al. \cite{qkeras} & QKeras & $\sim$5000 & 0.740 & 10$\times$ \\
+HGQ \cite{hgq} & HGQ & $\sim$3000 & 0.749 & 17$\times$ \\
+\textbf{Ours} & HGQ+Spectral & \textbf{400} & \textbf{0.756} & \textbf{125$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}

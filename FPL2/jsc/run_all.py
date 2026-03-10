@@ -36,6 +36,7 @@ from data.data import get_data
 from utils import (
     get_tf_device,
     spectral_quant_prune_to_ebops,
+    SensitivityAwarePruner,
     bisect_ebops_to_target,
     compute_model_ebops,
     BetaOnlyBudgetController,
@@ -44,6 +45,7 @@ from utils import (
     ProgressiveBudgetController,
     BetaCurriculumController,
     AdaptiveLRBiwidthScaler,
+    EBOPsConstantProjector,
     _set_all_beta,
     _get_active_bk_mean,
     SpectralGradientRevivalCallback,
@@ -150,29 +152,56 @@ def get_target_overrides(target_ebops: float) -> dict:
     """返回针对特定 eBOPs 目标的配置覆盖项。"""
     if target_ebops <= 500:
         # 极端低预算: 仅保留 ~2% 连接
-        # 关键: Phase 2 必须极度保守 — 没有 SpectralReg/EdgeRewiring 保护
-        # 稍有不慎 beta 就会杀死仅存的连接 → acc 崩塌
+        # ★ 核心策略: 完全对齐 FPL/jsc/train_run_low_budget.py
+        #   1. SensitivityAwarePruner 剪枝到 warmup=3000 (保留 ~72% 精度)
+        #   2. bisect 校准到 3000
+        #   3. ProgressiveBudgetController 在 3000 epoch 内从 3000 衰减到 target
+        #   4. BetaCurriculumController 打破 acc 停滞死锁
+        #   5. 不使用 SoftDeathFloor (与 beta 渐进压缩冲突)
+        #   FPL reference: warmup=3000, 达到 val_acc=0.730 @ 400 eBOPs
         return dict(
-            warmup_ebops_mul    = 3.0,       # 从 1200 渐降到 400
-            budget_decay_epochs = 4000,      # 更长衰减
-            min_degree          = 2,         # 谱保证放松
-            phase1_epochs       = 8000,      # 更多恢复时间
-            phase2_epochs       = 8000,      # 保守: 不需要太长
+            # SensitivityAwarePruner 剪枝到 warmup=3000 (匹配 FPL)
+            use_sensitivity_pruner = True,   # ★ 用 SAP 替代 spectral/bisect-only
+            warmup_ebops_mul    = 3000.0 / max(target_ebops, 1),  # warmup=3000
+            budget_decay_epochs = 3000,      # 3000 ep (匹配 FPL BUDGET_DECAY_EP)
+            min_degree          = 2,
+
+            # Phase 1: 恢复 + 渐进压缩 (完全匹配 FPL)
+            phase1_epochs       = 6000,      # 匹配 FPL PHASE1_EPOCHS
             phase1_lr           = 2e-3,
-            phase2_lr           = 3e-4,      # Phase2 低 LR: 保护脆弱连接
             phase1_lr_cycle     = 2000,
-            phase2_lr_cycle     = 600,
-            phase1_beta_max     = 2e-4,      # Phase1 限制 beta 上限
-            phase2_beta_max     = 5e-6,      # ★ Phase2 极低 beta 上限: 仅轻微约束
-            beta_stall_patience = 600,       # 更快检测停滞
-            beta_recover_epochs = 200,       # 短恢复
-            beta_recover_floor  = 1e-7,      # RECOVER 期间保留微弱压力
-            beta_max_restarts   = 10,
-            beta_curriculum_p2  = False,     # ★ Phase2 禁用课程重启 (会摧毁模型)
-            earlystop_patience  = 6000,
-            phase1_margin       = 0.25,      # 宽 margin 
-            phase2_margin       = 0.15,      # Phase2 也宽: 容忍波动
-            phase2_adjust_factor = 1.05,     # ★ Phase2 极弱 beta 调节
+            phase1_lr_mmul      = 0.9,
+            phase1_beta_init    = 1e-5,
+            phase1_beta_min     = 1e-8,
+            phase1_beta_max     = 5e-4,
+            phase1_margin       = 0.15,
+
+            # Phase 2: 精度最大化 (完全匹配 FPL)
+            phase2_epochs       = 12000,     # 匹配 FPL PHASE2_EPOCHS
+            phase2_lr           = 5e-4,
+            phase2_lr_cycle     = 800,
+            phase2_lr_mmul      = 0.95,
+            phase2_beta_min     = 1e-8,
+            phase2_beta_max     = 5e-4,
+            phase2_margin       = 0.05,
+
+            # Beta 课程重启 (匹配 FPL)
+            beta_curriculum_enabled = True,
+            beta_stall_patience = 600,
+            beta_recover_epochs = 300,
+            beta_restart_decay  = 0.25,
+            beta_max_restarts   = 8,
+
+            # 自适应 LR (匹配 FPL)
+            adaptive_lr_enabled = True,
+
+            # 禁用 SoftDeathFloor (FPL reference 不使用)
+            soft_floor_b        = 0.0,
+            soft_floor_every    = 999999,
+
+            revival_enabled     = False,
+            earlystop_patience  = 5000,
+            clipnorm            = 1.0,
         )
     elif target_ebops <= 2000:
         # 低预算 (1000-2000): 当前默认配置已针对 1500 优化
@@ -235,7 +264,8 @@ parser = argparse.ArgumentParser(
     description='FPL2-JSC: Spectral pruning + RigL revival Pareto search')
 
 parser.add_argument('--pretrained', type=str,
-                    default='pretrained_weight/epoch=7789-val_acc=0.770-ebops=19899-val_loss=0.641.keras',
+                    # default='pretrained_weight/FPL2/jsc/pretrained_weight/epoch=2236-val_acc=0.770-ebops=23589-val_loss=0.641.keras',
+                    default= 'pretrained_weight/epoch=2236-val_acc=0.770-ebops=23589-val_loss=0.641.keras', # FPL2/jsc/pretrained_weight/epoch=2236-val_acc=0.770-ebops=23589-val_loss=0.641.keras
                     help='Pretrained weight path')
 parser.add_argument('--target_ebops', type=float, default=DEFAULT_CONFIG['target_ebops'],
                     help='Target eBOPs for pruning + training (default: 1500)')
@@ -331,6 +361,9 @@ def run(cfg: dict):
     warmup_ebops = target_ebops * warmup_ebops_mul
     budget_decay_epochs = cfg.get('budget_decay_epochs', 3000)
 
+    # 投影器模式 (极低预算: beta=0, 用 EBOPsConstantProjector 维持 eBOPs)
+    use_projector = cfg.get('use_projector', False)
+
     output_folder = cfg.get('output_dir', '') or f'results/ebops{int(target_ebops)}_{init_bw}bit/'
     os.makedirs(output_folder, exist_ok=True)
     device = get_tf_device()
@@ -349,6 +382,8 @@ def run(cfg: dict):
     print(f'  Pruning: spectral_quant  min_deg={cfg["min_degree"]}')
     print(f'  Beta curriculum: {cfg.get("beta_curriculum_enabled", True)}  '
           f'Adaptive LR: {cfg.get("adaptive_lr_enabled", True)}')
+    if use_projector:
+        print(f'  ★ Projector mode: beta=0, EBOPsConstantProjector controls eBOPs')
     kd_enabled = cfg.get('kd_enabled', False)
     kd_alpha = cfg.get('kd_alpha', 0.3)
     kd_temperature = cfg.get('kd_temperature', 4.0)
@@ -397,30 +432,60 @@ def run(cfg: dict):
     pretrained_ebops = compute_model_ebops(model, _sample)
     print(f'  Pretrained eBOPs: {pretrained_ebops:.0f}')
 
-    # ── 3. 谱约束剪枝 (到 warmup_ebops，而非直接到 target) ─────────────────
-    print(f'\n[3/5] Spectral-quant pruning → warmup_eBOPs={warmup_ebops:.0f} '
-          f'(final target={target_ebops:.0f})')
+    # ── 3. 剪枝到 warmup_ebops (而非直接到 target) ────────────────────────
+    pruning_method = cfg.get('pruning_method', 'auto')  # auto / spectral / sensitivity / random / magnitude
+    use_sensitivity = cfg.get('use_sensitivity_pruner', False)
 
-    _, used_structured = spectral_quant_prune_to_ebops(
-        model,
-        target_ebops=warmup_ebops,
-        sample_input=_sample,
-        min_degree=cfg['min_degree'],
-        b_floor=0.35,
-        b_ceiling=6.0,
-        verbose=True,
-    )
-    print_bk_stats(model, 'after spectral_quant')
+    if pruning_method in ('random', 'magnitude'):
+        # ── Ablation 剪枝方法: random / magnitude ──────────────────────
+        from utils.pruning import random_prune_to_ebops, magnitude_prune_to_ebops
+        print(f'\n[3/5] {pruning_method} pruning → warmup_eBOPs={warmup_ebops:.0f} '
+              f'(final target={target_ebops:.0f})')
+        if pruning_method == 'random':
+            random_prune_to_ebops(model, warmup_ebops, _sample, verbose=True)
+        else:
+            magnitude_prune_to_ebops(model, warmup_ebops, _sample, verbose=True)
+        print_bk_stats(model, f'after {pruning_method}')
+        used_structured = False
+    elif use_sensitivity or pruning_method == 'sensitivity':
+        # ── SensitivityAwarePruner: 匹配 FPL/jsc/train_run_low_budget.py ──
+        print(f'\n[3/5] SensitivityAwarePruner → warmup_eBOPs={warmup_ebops:.0f} '
+              f'(final target={target_ebops:.0f})')
+        pruner = SensitivityAwarePruner(
+            target_ebops=warmup_ebops,
+            pruned_threshold=0.1,
+            b_k_min=0.3,
+        )
+        pruner.prune_to_ebops(model, current_ebops=pretrained_ebops, verbose=True)
+        post_prune_e = compute_model_ebops(model, _sample)
+        print(f'  Post SensitivityAwarePruner: eBOPs={post_prune_e:.0f}')
+        print_bk_stats(model, 'after SAP')
+        used_structured = False
+    else:
+        print(f'\n[3/5] Spectral-quant pruning → warmup_eBOPs={warmup_ebops:.0f} '
+              f'(final target={target_ebops:.0f})')
+
+        _, used_structured = spectral_quant_prune_to_ebops(
+            model,
+            target_ebops=warmup_ebops,
+            sample_input=_sample,
+            min_degree=cfg['min_degree'],
+            b_floor=0.35,
+            b_ceiling=6.0,
+            verbose=True,
+        )
+        print_bk_stats(model, 'after spectral_quant')
 
     # 二分校准位宽精确命中 warmup 目标
+    _bisect_bk_min = 0.35 if not use_sensitivity else 0.01
     calibrated_ebops = bisect_ebops_to_target(
         model,
         target_ebops=warmup_ebops,
         sample_input=_sample,
-        tolerance=0.03,
+        tolerance=0.04,
         max_iter=24,
-        b_k_min=0.35,
-        allow_connection_kill=not used_structured,
+        b_k_min=_bisect_bk_min,
+        allow_connection_kill=not used_structured and not use_sensitivity,
     )
 
     pruned_ebops = compute_model_ebops(model, _sample)
@@ -437,33 +502,56 @@ def run(cfg: dict):
     print(f'  Pruned init saved: {init_path}')
 
     # ── 4. Phase 1: 恢复训练 + 渐进压缩 ─────────────────────────
-    print(f'\n[4/5] Phase 1: Recovery + Progressive Compression ({phase1_epochs} epochs)')
+    print(f'\n[4/5] Phase 1: Recovery + {"Projector" if use_projector else "Progressive Compression"} ({phase1_epochs} epochs)')
 
     _set_all_beta(model, cfg['phase1_beta_init'])
 
-    # Beta 预算控制器 (初始 target = warmup_ebops，由 ProgressiveBudgetController 渐进降低)
-    phase1_budget = BetaOnlyBudgetController(
-        target_ebops=warmup_ebops,   # 从 warmup 开始，而非直接 target
-        margin=cfg['phase1_margin'],
-        beta_init=cfg['phase1_beta_init'],
-        beta_min=cfg['phase1_beta_min'],
-        beta_max=cfg['phase1_beta_max'],
-        adjust_factor=1.3,
-        ema_alpha=0.3,
-        warmup_epochs=200,
-        max_change_ratio=2.0,
-        init_ebops=pruned_ebops,
-    )
-
-    # 渐进式预算: warmup_ebops → target_ebops 指数衰减
-    prog_budget = ProgressiveBudgetController(
-        budget_ctrl=phase1_budget,
-        warmup_ebops=warmup_ebops,
-        final_ebops=target_ebops,
-        decay_epochs=budget_decay_epochs,
-        start_epoch=0,
-    )
-    print(f'  [Progressive] {warmup_ebops:.0f} \u2192 {target_ebops:.0f} over {budget_decay_epochs} ep')
+    if use_projector:
+        # ── Projector 模式: beta=0, 直接投影维持 eBOPs ──────────────
+        _set_all_beta(model, 0.0)
+        # 创建投影器
+        phase1_projector = EBOPsConstantProjector(
+            target_ebops=target_ebops,
+            b_k_min=cfg.get('proj_b_k_min', 0.5),
+            b_k_max=8.0,
+            pruned_threshold=0.1,
+            start_epoch=0,
+            alpha_gamma=cfg.get('proj_alpha_gamma', 0.5),
+            alpha_min=cfg.get('proj_alpha_min', 0.80),
+            alpha_max=cfg.get('proj_alpha_max', 1.25),
+            ema_alpha=0.3,
+            project_activation=False,
+            log_scale=False,
+        )
+        # 伪 budget 对象 (仅供后续日志使用)
+        class _FakeBudget:
+            beta_current = 0.0
+        phase1_budget = _FakeBudget()
+        prog_budget = None
+        print(f'  [Projector] target={target_ebops:.0f}  b_k_min={cfg.get("proj_b_k_min", 0.5)}')
+    else:
+        # ── Beta 模式: BetaOnlyBudgetController + ProgressiveBudget ──
+        phase1_projector = None
+        phase1_budget = BetaOnlyBudgetController(
+            target_ebops=warmup_ebops,
+            margin=cfg['phase1_margin'],
+            beta_init=cfg['phase1_beta_init'],
+            beta_min=cfg['phase1_beta_min'],
+            beta_max=cfg['phase1_beta_max'],
+            adjust_factor=1.3,
+            ema_alpha=0.3,
+            warmup_epochs=200,
+            max_change_ratio=2.0,
+            init_ebops=pruned_ebops,
+        )
+        prog_budget = ProgressiveBudgetController(
+            budget_ctrl=phase1_budget,
+            warmup_ebops=warmup_ebops,
+            final_ebops=target_ebops,
+            decay_epochs=budget_decay_epochs,
+            start_epoch=0,
+        )
+        print(f'  [Progressive] {warmup_ebops:.0f} → {target_ebops:.0f} over {budget_decay_epochs} ep')
 
     # 连接复活回调
     _probe_n = min(512, len(X_train))
@@ -531,8 +619,6 @@ def run(cfg: dict):
     warmup = cfg.get('lr_warmup', 100)
     phase1_callbacks = [
         ebops_cb,
-        phase1_budget,
-        prog_budget,        # 渐进式预算衰减
         soft_floor,
         act_fixer,
         pareto_cb,
@@ -541,8 +627,15 @@ def run(cfg: dict):
         trace_cb,
         topo_plot_cb,
     ]
+    if use_projector:
+        # Projector 模式: 投影器替代 beta/progressive
+        phase1_callbacks.insert(1, phase1_projector)
+    else:
+        # Beta 模式: budget + progressive
+        phase1_callbacks.insert(1, phase1_budget)
+        phase1_callbacks.insert(2, prog_budget)
     if revival_cb is not None:
-        phase1_callbacks.insert(4, revival_cb)  # 复活放 soft_floor 之后
+        phase1_callbacks.insert(4, revival_cb)
 
     # Beta 课程重启 (打破 acc 停滞)
     if cfg.get('beta_curriculum_enabled', True):
@@ -578,27 +671,46 @@ def run(cfg: dict):
 
     phase1_ebops = compute_model_ebops(model, _sample)
     phase1_res = model.evaluate(dataset_val, verbose=0)
-    phase1_beta = phase1_budget.beta_current
+    phase1_beta = getattr(phase1_budget, 'beta_current', 0.0)
     print(f'\n  Phase 1 done: val_acc={phase1_res[1]:.4f}  eBOPs={phase1_ebops:.0f}  beta={phase1_beta:.2e}')
     print_bk_stats(model, 'end-of-Phase1')
 
     # ── 5. Phase 2: 精调 + Pareto 搜索 ───────────────────────────────────────
     print(f'\n[5/5] Phase 2: Fine-tuning + Pareto search ({phase2_epochs} epochs)')
 
-    # 继承 Phase 1 均衡 beta（对齐 reference: 平滑过渡）
-    p2_adjust = cfg.get('phase2_adjust_factor', 1.15)
-    phase2_budget = BetaOnlyBudgetController(
-        target_ebops=target_ebops,
-        margin=cfg['phase2_margin'],
-        beta_init=phase1_beta,
-        beta_min=cfg['phase2_beta_min'],
-        beta_max=cfg['phase2_beta_max'],
-        adjust_factor=p2_adjust,
-        ema_alpha=0.15,
-        warmup_epochs=0,
-        max_change_ratio=1.5,
-        init_ebops=phase1_ebops,
-    )
+    if use_projector:
+        # ── Projector 模式: 继续用投影器控制 eBOPs ──────────────────
+        _set_all_beta(model, 0.0)
+        phase2_projector = EBOPsConstantProjector(
+            target_ebops=target_ebops,
+            b_k_min=cfg.get('proj_b_k_min', 0.5),
+            b_k_max=8.0,
+            pruned_threshold=0.1,
+            start_epoch=phase1_epochs,
+            alpha_gamma=cfg.get('proj_alpha_gamma', 0.5),
+            alpha_min=cfg.get('proj_alpha_min', 0.80),
+            alpha_max=cfg.get('proj_alpha_max', 1.25),
+            ema_alpha=0.3,
+            project_activation=False,
+            log_scale=False,
+        )
+        phase2_budget = None
+    else:
+        # ── Beta 模式 ─────────────────────────────────────────────
+        phase2_projector = None
+        p2_adjust = cfg.get('phase2_adjust_factor', 1.15)
+        phase2_budget = BetaOnlyBudgetController(
+            target_ebops=target_ebops,
+            margin=cfg['phase2_margin'],
+            beta_init=phase1_beta,
+            beta_min=cfg['phase2_beta_min'],
+            beta_max=cfg['phase2_beta_max'],
+            adjust_factor=p2_adjust,
+            ema_alpha=0.15,
+            warmup_epochs=0,
+            max_change_ratio=1.5,
+            init_ebops=phase1_ebops,
+        )
 
     revival_cb_p2 = None
     if cfg['revival_enabled']:
@@ -635,7 +747,6 @@ def run(cfg: dict):
 
     phase2_callbacks = [
         ebops_cb,
-        phase2_budget,
         soft_floor,
         act_fixer,
         pareto_cb,
@@ -645,6 +756,10 @@ def run(cfg: dict):
         early_stop,
         topo_plot_cb,
     ]
+    if use_projector:
+        phase2_callbacks.insert(1, phase2_projector)
+    else:
+        phase2_callbacks.insert(1, phase2_budget)
     if revival_cb_p2 is not None:
         phase2_callbacks.insert(3, revival_cb_p2)
 
