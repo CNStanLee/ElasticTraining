@@ -9,6 +9,7 @@ run_paper_experiments.py — FPL 论文所需全部实验的统一入口
   C. 渐进预算 Ablation (不同 warmup 倍率 μ)
   D. Beta 课程 Ablation (开/关 + 不同 patience)
   E. 自适应 LR Ablation (开/关)
+  F. SoftDeathFloor Ablation (开/关 + 不同 soft_floor_alive 阈值)
 
 用法:
   python run_paper_experiments.py --list              # 列出所有实验
@@ -28,7 +29,8 @@ run_paper_experiments.py — FPL 论文所需全部实验的统一入口
   C 类: 4 × ~3h = ~12h
   D 类: 3 × ~3h = ~9h
   E 类: 1 × ~3h = ~3h
-  总计: ~48h  (workers=3 时 ~16h)
+  F 类: 7 × ~3h = ~21h  (F1 可复用 A1 结果)
+  总计: ~69h  (workers=3 时 ~23h)
 """
 
 import os
@@ -112,8 +114,44 @@ exp('E1_lr_disabled', 'Adaptive LR: disabled',
     dict(target_ebops=400, adaptive_lr_enabled=False))
 # E2 = A1 (enabled by default), 不需要单独跑
 
+# ─── F. SoftDeathFloor Ablation (Table 6) ────────────────────────────
+# 固定 target=400, 测试 SoftDeathFloor 效果 + soft_floor_alive 阈值消融
+# 注意: 400 eBOPs 的 get_target_overrides 默认禁用 SoftDeathFloor,
+#   因此需要在 overrides 中显式重新启用 (soft_floor_b, soft_floor_every)
+_SDF_ENABLE_BASE = dict(
+    target_ebops=400,
+    soft_floor_b=0.05,       # 重新启用: 死连接下限
+    soft_floor_every=50,     # 重新启用: 每 50 epoch 执行
+    plot_interval=3000,      # 减少拓扑绘图频率 (加速)
+)
+
+exp('F1_sdf_disabled',    'SDF ablation: disabled (baseline)',
+    dict(target_ebops=400))  # 使用 400 默认 (SDF 关闭)
+exp('F2_sdf_alive0.1',    'SDF ablation: alive_threshold=0.1',
+    dict(**_SDF_ENABLE_BASE, soft_floor_alive=0.1))
+exp('F3_sdf_alive0.2',    'SDF ablation: alive_threshold=0.2',
+    dict(**_SDF_ENABLE_BASE, soft_floor_alive=0.2))
+exp('F4_sdf_alive0.3',    'SDF ablation: alive_threshold=0.3',
+    dict(**_SDF_ENABLE_BASE, soft_floor_alive=0.3))
+exp('F5_sdf_alive0.4',    'SDF ablation: alive_threshold=0.4 (default)',
+    dict(**_SDF_ENABLE_BASE, soft_floor_alive=0.4))
+exp('F6_sdf_alive0.5',    'SDF ablation: alive_threshold=0.5',
+    dict(**_SDF_ENABLE_BASE, soft_floor_alive=0.5))
+exp('F7_sdf_alive0.6',    'SDF ablation: alive_threshold=0.6',
+    dict(**_SDF_ENABLE_BASE, soft_floor_alive=0.6))
+
+# ─── Note: F1 等价于 A1 (400 eBOPs default, SDF 关闭)
 # ─── Note: B1, C3, D3 均等价于 A1 (400 eBOPs default)
-# 如果 A1 已完成, B1/C3/D3 可直接链接其结果
+# 如果 A1 已完成, B1/C3/D3/F1 可直接链接其结果
+
+# 等价实验映射: {实验名: 可复用的源实验名}
+# 当源实验已完成时, 直接 symlink 结果, 跳过训练
+ALIASES = {
+    'B1_prune_spectral': 'A1_sweep_400',
+    'C3_budget_mu7.5':   'A1_sweep_400',
+    'D3_beta_patience600': 'A1_sweep_400',
+    'F1_sdf_disabled':   'A1_sweep_400',
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -122,7 +160,7 @@ exp('E1_lr_disabled', 'Adaptive LR: disabled',
 
 def build_config(exp_def):
     """构建完整实验配置 (合并 DEFAULT_CONFIG + target overrides + 实验覆盖)。"""
-    from run_all import DEFAULT_CONFIG, get_target_overrides
+    from FPL2.jsc.bk.run_all import DEFAULT_CONFIG, get_target_overrides
 
     cfg = dict(DEFAULT_CONFIG)
     cfg['pretrained'] = BASE_PRETRAINED
@@ -151,6 +189,37 @@ def run_experiment(exp_name, dry_run=False):
         print(f'  Available: {", ".join(sorted(EXPERIMENTS.keys()))}')
         return None
 
+    # ── 检查是否可复用等价实验的结果 ────────────────────────────────────
+    alias_src = ALIASES.get(exp_name)
+    if alias_src and not dry_run:
+        src_dir = f'results/paper/{alias_src}/'
+        src_result = os.path.join(src_dir, 'result_summary.json')
+        if os.path.isfile(src_result):
+            import shutil
+            dst_dir = EXPERIMENTS[exp_name]['output_dir']
+            print(f'\n  [{exp_name}] ≡ {alias_src} (等价实验, 复制结果)')
+            if os.path.exists(dst_dir):
+                shutil.rmtree(dst_dir)
+            shutil.copytree(src_dir, dst_dir)
+            # 更新 meta 中的实验名
+            meta_path = os.path.join(dst_dir, 'experiment_meta.json')
+            if os.path.isfile(meta_path):
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                meta['experiment'] = exp_name
+                meta['aliased_from'] = alias_src
+                with open(meta_path, 'w') as f:
+                    json.dump(meta, f, indent=2)
+            with open(src_result) as f:
+                result = json.load(f)
+            result['experiment'] = exp_name
+            result['aliased_from'] = alias_src
+            result_path = os.path.join(dst_dir, 'result_summary.json')
+            with open(result_path, 'w') as f:
+                json.dump(result, f, indent=2)
+            print(f'  [{exp_name}] Done (copied from {alias_src})')
+            return result
+
     exp_def = EXPERIMENTS[exp_name]
     cfg = build_config(exp_def)
 
@@ -162,7 +231,9 @@ def run_experiment(exp_name, dry_run=False):
           f'warmup_mul={cfg.get("warmup_ebops_mul", 2.0):.1f}  '
           f'beta_curriculum={cfg.get("beta_curriculum_enabled", True)}  '
           f'adaptive_lr={cfg.get("adaptive_lr_enabled", True)}  '
-          f'pruning={cfg.get("pruning_method", "auto")}')
+          f'pruning={cfg.get("pruning_method", "auto")}  '
+          f'sdf_alive={cfg.get("soft_floor_alive", 0.4)}  '
+          f'sdf_b={cfg.get("soft_floor_b", 0.05)}')
     print(f'{"#" * 72}')
 
     if dry_run:
@@ -184,7 +255,7 @@ def run_experiment(exp_name, dry_run=False):
         json.dump(meta, f, indent=2)
 
     # 运行
-    from run_all import run
+    from FPL2.jsc.bk.run_all import run
     t0 = time.time()
     try:
         result = run(cfg)
@@ -574,6 +645,7 @@ def print_experiment_list():
                 'C': 'C. 渐进预算 Ablation (Table 3)',
                 'D': 'D. Beta 课程 Ablation (Table 4)',
                 'E': 'E. 自适应 LR Ablation (Table 5)',
+                'F': 'F. SoftDeathFloor Ablation (Table 6)',
             }
             print(f'\n  ── {labels.get(group, group)} ──')
             prev_group = group

@@ -77,18 +77,24 @@ from .pruning import (
     apply_ramanujan_bw_init,
     RamanujanMaskEnforcer,
     spectral_quant_prune_to_ebops,
+    spectral_sensitivity_prune_to_ebops,
     SensitivityAwarePruner,
     bisect_ebops_to_target,
     snap_active_bk,
     compute_model_ebops,
     random_prune_to_ebops,
     magnitude_prune_to_ebops,
+    random_init_prune_to_ebops,
+    snip_prune_to_ebops,
+    grasp_prune_to_ebops,
+    synflow_prune_to_ebops,
 )
 from .budget import (
     BetaOnlyBudgetController,
     KQBStabilizer,
     ActivationBitsFixer,
     SoftDeathFloor,
+    TopologyRescueCallback,
     ProgressiveBudgetController,
     BetaCurriculumController,
     AdaptiveLRBiwidthScaler,
@@ -97,10 +103,17 @@ from .budget import (
     _get_active_bk_mean,
 )
 from .revival import SpectralGradientRevivalCallback
+from .elasticity import (
+    WarmTopologyFloor,
+    ImportanceRebalance,
+    StochasticTopologyExplore,
+)
 from .training import (
     cosine_decay_restarts_schedule,
     TrainingTraceToH5,
     BudgetAwareEarlyStopping,
+    StochasticWeightAveraging,
+    generate_self_distillation_labels,
 )
 from .plotting import (
     TopologyGraphPlotter,

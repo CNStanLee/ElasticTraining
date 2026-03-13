@@ -383,6 +383,265 @@ class SoftDeathFloor(keras.callbacks.Callback):
 # ═══════════════════════════════════════════════════════════════════════════════
 # ProgressiveBudgetController — 渐进式预算衰减
 # ═══════════════════════════════════════════════════════════════════════════════
+# TopologyRescueCallback — 停滞触发、结构感知、预算中性的拓扑修复
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TopologyRescueCallback(keras.callbacks.Callback):
+    """停滞触发、结构感知、预算中性的拓扑修复。
+
+    SoftDeathFloor 的问题:
+      - 无条件周期性执行，不管网络是否需要帮助
+      - 把所有濒死连接钳位到 b_floor=0.05 (< 0.5)，前向仍为 0，
+        只靠 STE 传梯度，但在如此低 b 值下 STE 噪声极大
+      - 与 beta 优化器形成对抗循环: beta 压低 b → SDF 抬高 b → beta 更用力压低
+      - 实验 D 证明: SDF 越频繁/越激进，精度越低
+
+    TopologyRescue 的改进:
+      1. 停滞触发: 只在 val_accuracy 停滞 stall_patience epoch 后才干预
+      2. 结构感知: 只复活满足谱条件（节点度不足）的死连接
+      3. 有效复活: revival_b_val 设为有意义的位宽 (如 1.0)，
+         round_conv(1.0) > 0 → 前向有信号 → 梯度有效
+      4. 预算中性: 复活时同时杀掉等量最弱活跃连接 (swap-kill)，
+         不增加 eBOPs → 不与 beta 调度器冲突
+      5. 衰减冷却: 每次干预后长 cool_down，干预强度随次数递减
+
+    本质是"拓扑扰动"策略:
+      - 正常训练时完全不干预，让优化器自由塑造拓扑
+      - 陷入停滞时，通过局部 swap 探索替代拓扑
+      - 优化器在新拓扑上重新优化，可能逃逸局部最优
+
+    Parameters
+    ----------
+    revival_b_val : float
+        复活连接的目标位宽 (默认 1.0 = 有效 1-bit)
+    check_interval : int
+        每 N epoch 检查是否需要干预
+    stall_patience : int
+        val_accuracy 停滞多少 epoch 后触发
+    min_delta : float
+        判定改善的最小增量
+    max_swap_per_layer : int
+        每次每层最多 swap 多少连接
+    swap_budget_neutral : bool
+        是否 swap-kill (复活+杀死等量弱连接)
+    min_degree : int
+        谱条件: 节点最小入度/出度
+    cool_down : int
+        两次干预的最小间隔 epoch
+    max_interventions : int
+        总干预上限
+    alive_threshold : float
+        b < 此值视为死连接
+    decay_factor : float
+        每次干预后 max_swap 乘以此因子 (衰减)
+    kernel_init_scale : float
+        复活 kernel 为 0 时的初始化标准差
+    """
+
+    def __init__(
+        self,
+        revival_b_val: float = 1.0,
+        check_interval: int = 50,
+        stall_patience: int = 300,
+        min_delta: float = 5e-5,
+        max_swap_per_layer: int = 4,
+        swap_budget_neutral: bool = True,
+        min_degree: int = 2,
+        cool_down: int = 200,
+        max_interventions: int = 10,
+        alive_threshold: float = 0.5,
+        decay_factor: float = 0.85,
+        kernel_init_scale: float = 0.01,
+    ):
+        super().__init__()
+        self.revival_b_val = float(revival_b_val)
+        self.check_interval = max(1, int(check_interval))
+        self.stall_patience = int(stall_patience)
+        self.min_delta = float(min_delta)
+        self.max_swap_per_layer = int(max_swap_per_layer)
+        self.swap_budget_neutral = bool(swap_budget_neutral)
+        self.min_degree = int(min_degree)
+        self.cool_down = int(cool_down)
+        self.max_interventions = int(max_interventions)
+        self.alive_threshold = float(alive_threshold)
+        self.decay_factor = float(decay_factor)
+        self.kernel_init_scale = float(kernel_init_scale)
+
+        self._best_acc = -1.0
+        self._stall_counter = 0
+        self._last_intervention_epoch = -cool_down
+        self._n_interventions = 0
+        self._current_max_swap = float(max_swap_per_layer)
+        self._total_revived = 0
+        self._total_killed = 0
+
+    def _spectral_candidates(self, b_arr: np.ndarray) -> list[tuple[int, int]]:
+        """找出因入度/出度不足需复活的死连接候选 (row, col)。"""
+        if b_arr.ndim == 1:
+            return []
+        if b_arr.ndim > 2:
+            b_arr = b_arr.reshape(b_arr.shape[0], -1)
+
+        dead = (b_arr < self.alive_threshold)
+        active = ~dead
+        out_degree = active.sum(axis=1)   # 每行 = input node 出度
+        in_degree = active.sum(axis=0)    # 每列 = output node 入度
+
+        candidates = set()
+        # 找出度不足的 input 节点，其死连接是候选
+        for r in np.where(out_degree < self.min_degree)[0]:
+            for c in np.where(dead[r])[0]:
+                candidates.add((int(r), int(c)))
+        # 找入度不足的 output 节点
+        for c in np.where(in_degree < self.min_degree)[0]:
+            for r in np.where(dead[:, c])[0]:
+                candidates.add((int(r), int(c)))
+        return list(candidates)
+
+    def _rank_by_kernel_magnitude(self, layer, candidates, orig_shape):
+        """用 |kernel| 为复活候选排序 (大 → 有潜力)。"""
+        kernel = getattr(layer, 'kernel', None)
+        scored = []
+        if kernel is not None:
+            try:
+                w = np.abs(kernel.numpy())
+                w_2d = w.reshape(w.shape[0], -1) if w.ndim > 2 else w
+                for (r, c) in candidates:
+                    if r < w_2d.shape[0] and c < w_2d.shape[1]:
+                        scored.append((float(w_2d[r, c]), r, c))
+                    else:
+                        scored.append((0.0, r, c))
+            except Exception:
+                scored = [(np.random.rand(), r, c) for (r, c) in candidates]
+        else:
+            scored = [(np.random.rand(), r, c) for (r, c) in candidates]
+        scored.sort(reverse=True)
+        return scored
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        val_acc = float(logs.get('val_accuracy', logs.get('val_acc', -1.0)))
+        if val_acc < 0:
+            return
+
+        # ── 停滞检测 ────────────────────────────────────────────────
+        if val_acc > self._best_acc + self.min_delta:
+            self._best_acc = val_acc
+            self._stall_counter = 0
+        else:
+            self._stall_counter += 1
+
+        # ── 检查触发条件 ───────────────────────────────────────────
+        if self._stall_counter < self.stall_patience:
+            return
+        if (epoch + 1) % self.check_interval != 0:
+            return
+        if (epoch - self._last_intervention_epoch) < self.cool_down:
+            return
+        if self._n_interventions >= self.max_interventions:
+            return
+
+        effective_max_swap = max(1, int(self._current_max_swap))
+
+        # ── 遍历各层执行拓扑修复 ─────────────────────────────────
+        total_revived = 0
+        total_killed = 0
+
+        for layer in _flatten_layers(self.model):
+            kq = getattr(layer, 'kq', None)
+            if kq is None or not hasattr(layer, 'kernel'):
+                continue
+            b_var = _get_kq_var(kq, 'b')
+            if b_var is None:
+                b_var = _get_kq_var(kq, 'f')
+            if b_var is None:
+                continue
+
+            b_arr = b_var.numpy()
+            orig_shape = b_arr.shape
+            b_2d = b_arr.reshape(b_arr.shape[0], -1) if b_arr.ndim > 2 else b_arr
+
+            # 谱条件查找候选
+            candidates = self._spectral_candidates(b_2d)
+            if not candidates:
+                continue
+
+            # 按 |kernel| 排序
+            ranked = self._rank_by_kernel_magnitude(layer, candidates, orig_shape)
+            top_k = ranked[:effective_max_swap]
+            if not top_k:
+                continue
+
+            # ── Swap-kill: 找等量最弱活跃连接 ──────────────────
+            kill_set = []
+            if self.swap_budget_neutral:
+                revive_set = {(r, c) for (_, r, c) in top_k}
+                alive_conns = []
+                for r in range(b_2d.shape[0]):
+                    for c in range(b_2d.shape[1]):
+                        if b_2d[r, c] >= self.alive_threshold and (r, c) not in revive_set:
+                            alive_conns.append((float(b_2d[r, c]), r, c))
+                alive_conns.sort()  # 按 b 从小到大 → 最弱在前
+                kill_set = [(r, c) for (_, r, c) in alive_conns[:len(top_k)]]
+
+                # 杀死
+                for (r, c) in kill_set:
+                    b_2d[r, c] = 0.0
+
+            # ── 复活 ──────────────────────────────────────────────
+            for (score, r, c) in top_k:
+                b_2d[r, c] = self.revival_b_val
+
+            # 写回
+            if b_arr.ndim > 2:
+                b_new = b_2d.reshape(orig_shape)
+            else:
+                b_new = b_2d
+            b_var.assign(b_new.astype(np.float32))
+
+            # 同步恢复 kernel
+            kernel = getattr(layer, 'kernel', None)
+            if kernel is not None:
+                k = kernel.numpy().astype(np.float32)
+                k_2d = k.reshape(k.shape[0], -1) if k.ndim > 2 else k
+                for (score, r, c) in top_k:
+                    if r < k_2d.shape[0] and c < k_2d.shape[1]:
+                        if abs(k_2d[r, c]) < 1e-10:
+                            k_2d[r, c] = np.random.randn() * self.kernel_init_scale
+                if k.ndim > 2:
+                    k = k_2d.reshape(k.shape)
+                else:
+                    k = k_2d
+                kernel.assign(k.astype(np.float32))
+
+            total_revived += len(top_k)
+            total_killed += len(kill_set)
+
+            lname = getattr(layer, 'name', str(id(layer)))
+            print(f'  [TopoRescue] {lname}: revived={len(top_k)} killed={len(kill_set)} '
+                  f'(candidates={len(candidates)}, '
+                  f'top |w|={top_k[0][0]:.3e}..{top_k[-1][0]:.3e})')
+
+        # ── 更新状态 ─────────────────────────────────────────────
+        if total_revived > 0:
+            self._last_intervention_epoch = epoch
+            self._n_interventions += 1
+            self._total_revived += total_revived
+            self._total_killed += total_killed
+            self._current_max_swap *= self.decay_factor  # 衰减
+            self._stall_counter = 0  # 重置停滞计数器
+
+            print(f'  [TopoRescue] epoch={epoch}  intervention #{self._n_interventions}'
+                  f'/{self.max_interventions}  revived={total_revived} killed={total_killed}'
+                  f'  total_revived={self._total_revived}  stall_was={self.stall_patience}ep'
+                  f'  next_max_swap={max(1, int(self._current_max_swap))}')
+
+            logs['topo_rescue_revived'] = total_revived
+            logs['topo_rescue_killed'] = total_killed
+            logs['topo_rescue_interventions'] = self._n_interventions
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class ProgressiveBudgetController(keras.callbacks.Callback):
     """课程式 EBOPs：target 从 warmup_ebops 指数衰减到 final_ebops。

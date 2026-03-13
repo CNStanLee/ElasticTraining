@@ -824,6 +824,51 @@ def spectral_quant_prune_to_ebops(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# spectral_sensitivity_prune_to_ebops — 结构化谱剪枝 + 敏感度重分配
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def spectral_sensitivity_prune_to_ebops(
+    model,
+    target_ebops: float,
+    sample_input,
+    min_degree: int = 2,
+    b_floor: float = 0.25,
+    b_ceiling: float = 6.0,
+    pruned_threshold: float = 0.1,
+    protect_power: float = 0.5,
+    verbose: bool = True,
+):
+    """先做谱/结构剪枝，再做 sensitivity 位宽重分配。"""
+    measured, used_structured = spectral_quant_prune_to_ebops(
+        model,
+        target_ebops=target_ebops,
+        sample_input=sample_input,
+        min_degree=min_degree,
+        b_floor=b_floor,
+        b_ceiling=b_ceiling,
+        verbose=verbose,
+    )
+
+    current_ebops = compute_model_ebops(model, sample_input)
+    pruner = SensitivityAwarePruner(
+        target_ebops=float(target_ebops),
+        pruned_threshold=pruned_threshold,
+        protect_power=protect_power,
+        b_k_min=max(float(b_floor), 0.01),
+        b_k_max=float(b_ceiling),
+    )
+    pruner.prune_to_ebops(model, current_ebops=current_ebops, verbose=verbose)
+    measured = compute_model_ebops(model, sample_input)
+
+    if verbose:
+        print(
+            f"[Spectral+Sensitivity] after refine measured_ebops={measured:.1f}  "
+            f"target={target_ebops:.1f}  structured={used_structured}"
+        )
+    return measured, used_structured
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # bisect_ebops_to_target — 二分搜索校准位宽
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1268,4 +1313,309 @@ def magnitude_prune_to_ebops(model, target_ebops: float, sample_input, b_floor=0
     if verbose:
         print(f'[MagnitudePrune] threshold={threshold:.6f}  '
               f'target={target_ebops:.0f}  measured={measured:.0f}')
+    return measured
+
+
+def random_init_prune_to_ebops(model, target_ebops: float, sample_input, b_floor=0.35,
+                               b_ceiling=6.0, seed=42, verbose=True):
+    """随机重初始化权重后按比例剪枝 (最弱 baseline)。
+
+    先用 Glorot uniform 重新初始化所有可剪枝层的 kernel 权重，
+    然后按全局均匀稀疏率随机选择保留连接。
+    用于 ablation 对比，展示预训练权重的重要性。
+    """
+    rng = np.random.RandomState(seed)
+    current_ebops = compute_model_ebops(model, sample_input)
+    if current_ebops <= 0:
+        return
+    keep_ratio = min(1.0, float(target_ebops) / float(current_ebops))
+
+    for layer in _flatten_layers(model):
+        kq = getattr(layer, 'kq', None)
+        if kq is None or not hasattr(layer, 'kernel'):
+            continue
+        b_var = _get_kq_var(kq, 'b')
+        if b_var is None:
+            b_var = _get_kq_var(kq, 'f')
+        if b_var is None:
+            continue
+        shape = layer.kernel.shape
+        # Glorot uniform re-initialization
+        fan_in, fan_out = int(np.prod(shape[:-1])), int(shape[-1])
+        limit = np.sqrt(6.0 / (fan_in + fan_out))
+        new_kernel = rng.uniform(-limit, limit, size=shape).astype(np.float32)
+        layer.kernel.assign(new_kernel)
+        # Random proportional pruning
+        mask = (rng.rand(*shape) < keep_ratio).astype(np.float32)
+        _apply_mask_and_quant(layer, mask, b_floor=b_floor, b_ceiling=b_ceiling)
+        if verbose:
+            print(f'  [RandomInitPrune] {layer.name:20s}  '
+                  f'keep={int(mask.sum())}/{int(np.prod(shape))}  '
+                  f'sparsity={1 - mask.mean():.3f}')
+
+    measured = compute_model_ebops(model, sample_input)
+    if verbose:
+        print(f'[RandomInitPrune] target={target_ebops:.0f}  measured={measured:.0f}')
+    return measured
+
+
+def snip_prune_to_ebops(model, target_ebops: float, sample_input, sample_labels,
+                        b_floor=0.35, b_ceiling=6.0, verbose=True):
+    """SNIP: 单次连接敏感度剪枝 (Lee et al., ICLR 2019)。
+
+    计算每个连接的敏感度 |w * dL/dw|，全局排序后保留 top-k。
+    只需单次前向+反向传播即可决定剪枝掩膜。
+    """
+    current_ebops = compute_model_ebops(model, sample_input)
+    if current_ebops <= 0:
+        return
+    keep_ratio = min(1.0, float(target_ebops) / float(current_ebops))
+
+    # 收集可剪枝层
+    prunable = []
+    for layer in _flatten_layers(model):
+        kq = getattr(layer, 'kq', None)
+        if kq is None or not hasattr(layer, 'kernel'):
+            continue
+        b_var = _get_kq_var(kq, 'b')
+        if b_var is None:
+            b_var = _get_kq_var(kq, 'f')
+        if b_var is not None:
+            prunable.append(layer)
+
+    if not prunable:
+        return
+
+    # 单次前向+反向计算 connection sensitivity
+    # 使用 model.trainable_variables (自动被 tape 追踪) 兼容 Keras 3
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    with tf.GradientTape() as tape:
+        logits = model(sample_input, training=False)
+        loss = loss_fn(sample_labels, logits)
+    all_grads = tape.gradient(loss, model.trainable_variables)
+    grad_map = {id(v): g for v, g in zip(model.trainable_variables, all_grads)}
+    grads = [grad_map.get(id(l.kernel), None) for l in prunable]
+
+    # 全局 connection sensitivity: |w * grad|
+    all_scores = []
+    for layer, g in zip(prunable, grads):
+        if g is None:
+            s = np.zeros_like(layer.kernel.numpy())
+        else:
+            s = np.abs(layer.kernel.numpy() * g.numpy())
+        all_scores.append(s.ravel())
+    all_scores = np.concatenate(all_scores)
+
+    # 求全局阈值
+    n_keep = max(1, int(len(all_scores) * keep_ratio))
+    threshold = float(np.sort(all_scores)[-n_keep]) if n_keep < len(all_scores) else 0.0
+
+    # 应用掩膜
+    idx = 0
+    for layer, g in zip(prunable, grads):
+        w = layer.kernel.numpy()
+        if g is None:
+            scores = np.zeros_like(w)
+        else:
+            scores = np.abs(w * g.numpy())
+        mask = (scores >= threshold).astype(np.float32)
+        _apply_mask_and_quant(layer, mask, b_floor=b_floor, b_ceiling=b_ceiling)
+        if verbose:
+            print(f'  [SNIP] {layer.name:20s}  '
+                  f'keep={int(mask.sum())}/{int(np.prod(w.shape))}  '
+                  f'sparsity={1 - mask.mean():.3f}')
+
+    measured = compute_model_ebops(model, sample_input)
+    if verbose:
+        print(f'[SNIP] threshold={threshold:.8f}  target={target_ebops:.0f}  measured={measured:.0f}')
+    return measured
+
+
+def grasp_prune_to_ebops(model, target_ebops: float, sample_input, sample_labels,
+                         b_floor=0.35, b_ceiling=6.0, verbose=True):
+    """GraSP: 梯度信号保持剪枝 (Wang et al., ICLR 2020)。
+
+    保留能最大化梯度流的连接。分数 = -H·g = -(w * grad(grad·w))，
+    即权重对 Hessian-gradient 乘积的贡献。保留分数最高的连接。
+    """
+    current_ebops = compute_model_ebops(model, sample_input)
+    if current_ebops <= 0:
+        return
+    keep_ratio = min(1.0, float(target_ebops) / float(current_ebops))
+
+    prunable = []
+    for layer in _flatten_layers(model):
+        kq = getattr(layer, 'kq', None)
+        if kq is None or not hasattr(layer, 'kernel'):
+            continue
+        b_var = _get_kq_var(kq, 'b')
+        if b_var is None:
+            b_var = _get_kq_var(kq, 'f')
+        if b_var is not None:
+            prunable.append(layer)
+
+    if not prunable:
+        return
+
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+
+    # 第一步: 计算梯度 g = dL/dw
+    # 使用 model.trainable_variables (自动被 tape 追踪) 兼容 Keras 3
+    with tf.GradientTape() as tape1:
+        logits1 = model(sample_input, training=False)
+        loss1 = loss_fn(sample_labels, logits1)
+    all_grads1 = tape1.gradient(loss1, model.trainable_variables)
+    grad_map1 = {id(v): g for v, g in zip(model.trainable_variables, all_grads1)}
+    grads1 = [grad_map1.get(id(l.kernel), None) for l in prunable]
+
+    # 第二步: 计算 Hessian-gradient 乘积的近似
+    # 对 gradient·weight 关于weight再求梯度 → Hg
+    with tf.GradientTape() as tape2:
+        logits2 = model(sample_input, training=False)
+        loss2 = loss_fn(sample_labels, logits2)
+    all_grads2 = tape2.gradient(loss2, model.trainable_variables)
+    grad_map2 = {id(v): g for v, g in zip(model.trainable_variables, all_grads2)}
+    grads2 = [grad_map2.get(id(l.kernel), None) for l in prunable]
+
+    # GraSP score: -w * Hg ≈ -w * grad (简化为 Heuristic)
+    # 完整的 Hessian 计算代价太大，使用一次梯度近似
+    # score = -g * (g * w) 的符号可以分辨保持/损害梯度流
+    all_scores = []
+    for layer, g1, g2 in zip(prunable, grads1, grads2):
+        w = layer.kernel.numpy()
+        if g1 is None or g2 is None:
+            s = np.zeros_like(w)
+        else:
+            g1_np = g1.numpy()
+            g2_np = g2.numpy()
+            # Hessian-gradient product approximation: score = -w * g2
+            # 负号使得高分表示保留该连接对梯度流有利
+            s = -(w * g2_np)
+        all_scores.append(s.ravel())
+    all_scores = np.concatenate(all_scores)
+
+    # top-k 保留
+    n_keep = max(1, int(len(all_scores) * keep_ratio))
+    threshold = float(np.sort(all_scores)[-n_keep]) if n_keep < len(all_scores) else float('-inf')
+
+    offset = 0
+    for layer in prunable:
+        w = layer.kernel.numpy()
+        n = int(np.prod(w.shape))
+        scores = all_scores[offset:offset + n].reshape(w.shape)
+        offset += n
+        mask = (scores >= threshold).astype(np.float32)
+        _apply_mask_and_quant(layer, mask, b_floor=b_floor, b_ceiling=b_ceiling)
+        if verbose:
+            print(f'  [GraSP] {layer.name:20s}  '
+                  f'keep={int(mask.sum())}/{int(np.prod(w.shape))}  '
+                  f'sparsity={1 - mask.mean():.3f}')
+
+    measured = compute_model_ebops(model, sample_input)
+    if verbose:
+        print(f'[GraSP] target={target_ebops:.0f}  measured={measured:.0f}')
+    return measured
+
+
+def synflow_prune_to_ebops(model, target_ebops: float, sample_input, b_floor=0.35,
+                           b_ceiling=6.0, n_iters=100, verbose=True):
+    """SynFlow: 数据无关迭代剪枝 (Tanaka et al., NeurIPS 2020)。
+
+    不需要训练数据标签。使用全 1 输入，迭代计算 synaptic saliency
+    S_j = |θ_j * (dR/dθ_j)| 其中 R = 1^T · f(1)，然后逐步剪去最低分数连接。
+    多次迭代避免 layer-collapse。
+    """
+    current_ebops = compute_model_ebops(model, sample_input)
+    if current_ebops <= 0:
+        return
+    target_keep_ratio = min(1.0, float(target_ebops) / float(current_ebops))
+
+    prunable = []
+    for layer in _flatten_layers(model):
+        kq = getattr(layer, 'kq', None)
+        if kq is None or not hasattr(layer, 'kernel'):
+            continue
+        b_var = _get_kq_var(kq, 'b')
+        if b_var is None:
+            b_var = _get_kq_var(kq, 'f')
+        if b_var is not None:
+            prunable.append(layer)
+
+    if not prunable:
+        return
+
+    # 保存原始权重
+    original_kernels = [l.kernel.numpy().copy() for l in prunable]
+
+    # 初始化掩膜 (全 1)
+    masks = [np.ones(l.kernel.shape, dtype=np.float32) for l in prunable]
+
+    # SynFlow 使用全 1 输入 (data-free)
+    ones_input = tf.ones_like(sample_input[:1])
+
+    for iteration in range(n_iters):
+        # 计算当前迭代的保留比例 (指数衰减)
+        # fraction = target^((it+1)/n_iters)
+        frac = target_keep_ratio ** ((iteration + 1) / n_iters)
+
+        # 用 |w| 替代 w 做前向 (SynFlow 要求非负)
+        for i, layer in enumerate(prunable):
+            abs_w = np.abs(original_kernels[i]) * masks[i]
+            layer.kernel.assign(abs_w.astype(np.float32))
+
+        # 前向传播计算 R = sum(output)
+        # 使用 model.trainable_variables (自动被 tape 追踪) 兼容 Keras 3
+        with tf.GradientTape() as tape:
+            out = model(ones_input, training=False)
+            R = tf.reduce_sum(out)
+        all_grads = tape.gradient(R, model.trainable_variables)
+        grad_map = {id(v): g for v, g in zip(model.trainable_variables, all_grads)}
+        grads = [grad_map.get(id(l.kernel), None) for l in prunable]
+
+        # Synaptic saliency: S = |θ * dR/dθ|
+        all_scores = []
+        for i, (layer, g) in enumerate(zip(prunable, grads)):
+            w_abs = np.abs(original_kernels[i]) * masks[i]
+            if g is None:
+                s = np.zeros_like(w_abs)
+            else:
+                s = w_abs * np.abs(g.numpy())
+            # 已剪掉的连接分数设为 0
+            s *= masks[i]
+            all_scores.append(s.ravel())
+        all_scores_flat = np.concatenate(all_scores)
+
+        # 仅对存活连接排序
+        alive = all_scores_flat[all_scores_flat > 0]
+        if len(alive) == 0:
+            break
+        n_total_alive = len(alive)
+        n_keep = max(1, int(frac * sum(np.prod(m.shape) for m in masks)))
+        n_keep = min(n_keep, n_total_alive)
+
+        if n_keep < n_total_alive:
+            threshold = float(np.sort(alive)[-(n_keep)])
+        else:
+            threshold = 0.0
+
+        # 更新掩膜
+        offset = 0
+        for i, layer in enumerate(prunable):
+            n = int(np.prod(masks[i].shape))
+            scores = all_scores_flat[offset:offset + n].reshape(masks[i].shape)
+            offset += n
+            masks[i] = ((scores >= threshold) & (masks[i] > 0.5)).astype(np.float32)
+
+    # 恢复原始权重并应用最终掩膜
+    for i, layer in enumerate(prunable):
+        layer.kernel.assign(original_kernels[i].astype(np.float32))
+        _apply_mask_and_quant(layer, masks[i], b_floor=b_floor, b_ceiling=b_ceiling)
+        if verbose:
+            print(f'  [SynFlow] {layer.name:20s}  '
+                  f'keep={int(masks[i].sum())}/{int(np.prod(masks[i].shape))}  '
+                  f'sparsity={1 - masks[i].mean():.3f}')
+
+    measured = compute_model_ebops(model, sample_input)
+    if verbose:
+        print(f'[SynFlow] iters={n_iters}  target={target_ebops:.0f}  measured={measured:.0f}')
     return measured

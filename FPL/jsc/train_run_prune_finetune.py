@@ -44,9 +44,8 @@ random.seed(42)
 # baseline epoch=2236 最高精度检查点（val_acc=0.770，ebops=23589）
 # BASELINE_CKPT  = 'results/baseline/epoch=2236-val_acc=0.770-ebops=23589-val_loss=0.641.keras'
 # BASELINE_EBOPS = 23589      # 从文件名读，作为剪枝前参考值
-BASELINE_CKPT = "results/baseline/epoch=7789-val_acc=0.770-ebops=19899-val_loss=0.641.keras"
-BASELINE_EBOPS = 19899
-
+BASELINE_CKPT = "results/baseline/epoch=2236-val_acc=0.770-ebops=23589-val_loss=0.641.keras"
+BASELINE_EBOPS = 23589
 TARGET_EBOPS = 8504
 
 # ── 剪枝方式 ──────────────────────────────────────────────────────────────────
